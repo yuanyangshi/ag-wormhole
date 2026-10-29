@@ -1,0 +1,71 @@
+# Build and Packaging Outputs
+out/
+dist/
+build/
+*.vsix
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Logs and Debug
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Testing & Coverage
+.vscode-test/
+coverage/
+.nyc_output/
+
+# Cache & Diagnostics
+.eslintcache/
+.parcel-cache/
+.turbo/
+tmp/
+temp/
+*.tmp
+
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+credentials.json
+secrets.yaml
+*.pem
+*.key
+
+# Editor and IDE Files
+.idea/
+*.iml
+*.iws
+*.ipr
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.vscode/*.local.json
+
+# Operating System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Custom Project Filters
+指南*.md
+
+.agents/
+CHANGELOG.md
+
