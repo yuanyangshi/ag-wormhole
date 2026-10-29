@@ -1,0 +1,172 @@
+{
+  "name": "ag-wormhole",
+  "publisher": "antigravity",
+  "displayName": "AG-Wormhole (Zero-Privilege Proxy Tunnel)",
+  "description": "High-performance zero-privilege dual-plane proxy tunnel and syscall redirection sandbox for Antigravity remote development environments.",
+  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ag-wormhole/ag-wormhole"
+  },
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ag-wormhole.setup",
+        "title": "AG-Wormhole: Setup Remote Environment"
+      },
+      {
+        "command": "ag-wormhole.rollback",
+        "title": "AG-Wormhole: Rollback Remote Environment"
+      },
+      {
+        "command": "ag-wormhole.enableForwarding",
+        "title": "AG-Wormhole: Enable Port Forwarding"
+      },
+      {
+        "command": "ag-wormhole.disableForwarding",
+        "title": "AG-Wormhole: Disable Port Forwarding"
+      },
+      {
+        "command": "ag-wormhole.tunnelStatus",
+        "title": "AG-Wormhole: Show Tunnel Status"
+      },
+      {
+        "command": "ag-wormhole.checkProxy",
+        "title": "AG-Wormhole: Check Proxy Health"
+      },
+      {
+        "command": "ag-wormhole.showOutput",
+        "title": "AG-Wormhole: Show Output Logs"
+      },
+      {
+        "command": "ag-wormhole.showStatusPanel",
+        "title": "AG-Wormhole: Show Status Dashboard"
+      },
+      {
+        "command": "ag-wormhole.refreshStatus",
+        "title": "AG-Wormhole: Refresh Status"
+      },
+      {
+        "command": "ag-wormhole.diagnose",
+        "title": "AG-Wormhole: Run Link Diagnostics"
+      },
+      {
+        "command": "ag-wormhole.showTrafficPanel",
+        "title": "AG-Wormhole: Show Traffic Telemetry"
+      },
+      {
+        "command": "ag-wormhole.reclaimPort",
+        "title": "AG-Wormhole: Reclaim Remote Proxy Port (Kill Zombie Sockets)"
+      },
+      {
+        "command": "ag-wormhole.optimizeSSH",
+        "title": "AG-Wormhole: Optimize SSH Keepalive & Connection Multiplexing"
+      }
+    ],
+    "configuration": {
+      "title": "AG-Wormhole",
+      "properties": {
+        "ag-wormhole.enableLocalForwarding": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Use local proxy via SSH tunnel. If true, the extension manages ~/.ssh/config.wormhole and forwards the remote port to your local machine."
+        },
+        "ag-wormhole.localProxyPort": {
+          "type": "number",
+          "default": 7890,
+          "scope": "application",
+          "description": "Local proxy port on your computer (e.g. 7890). Only used when enableLocalForwarding is true."
+        },
+        "ag-wormhole.remoteProxyHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "scope": "machine-overridable",
+          "description": "The host address on the remote server where the proxy is reachable. Use 127.0.0.1 when enableLocalForwarding is true."
+        },
+        "ag-wormhole.remoteProxyPort": {
+          "type": "number",
+          "default": 7890,
+          "scope": "machine-overridable",
+          "description": "The port on the remote server used as the proxy gateway."
+        },
+        "ag-wormhole.showStatusOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine-overridable",
+          "description": "Show a status notification when connecting to a remote server."
+        },
+        "ag-wormhole.watchdogInterval": {
+          "type": "number",
+          "default": 10,
+          "minimum": 3,
+          "maximum": 60,
+          "scope": "application",
+          "description": "Active tunnel watchdog probe interval in seconds (default: 10s)."
+        },
+        "ag-wormhole.autoReclaimPort": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine-overridable",
+          "description": "Automatically clear zombie sockets and dead processes occupying the remote proxy port upon failure."
+        },
+        "ag-wormhole.proxyType": {
+          "type": "string",
+          "default": "http",
+          "enum": [
+            "http",
+            "socks5"
+          ],
+          "enumDescriptions": [
+            "HTTP proxy (standard for HTTP/HTTPS forwarders)",
+            "SOCKS5 proxy (use if your proxy gateway only supports SOCKS5 protocol)"
+          ],
+          "scope": "machine-overridable",
+          "description": "The proxy protocol type (HTTP or SOCKS5)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:package": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test:unit": "tsc -p . --outDir out && mocha --ui tdd out/test/*.unit.test.js",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@types/vscode": "^1.100.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.7.1",
+    "esbuild": "^0.27.1",
+    "eslint": "^9.39.1",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.1"
+  }
+}
