@@ -30,6 +30,7 @@ export const CFG_SHOW_STATUS_ON_STARTUP = 'showStatusOnStartup';
 export const CFG_PROXY_TYPE = 'proxyType';
 export const CFG_WATCHDOG_INTERVAL = 'watchdogInterval';
 export const CFG_AUTO_RECLAIM_PORT = 'autoReclaimPort';
+export const CFG_AUTO_INJECT_TERMINAL_PROXY = 'autoInjectTerminalProxy';
 
 // SSH Include Configuration
 export const WORMHOLE_SSH_CONFIG_FILENAME = 'config.wormhole';

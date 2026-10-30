@@ -12,6 +12,8 @@ export interface ProxyStatus {
     remoteProxyReachable: boolean;
     lastUpdated: Date;
     languageServerConfigured?: boolean;
+    activeTunnelPort?: number;
+    isRelaying?: boolean;
 }
 
 export type StatusUpdateCallback = (status: ProxyStatus) => void;
@@ -47,6 +49,8 @@ export interface TrafficStats {
     sessionStartTime: Date;
     lastUpdated: Date;
     proxyReachable: boolean;
+    peakConnections?: number;
+    avgRttMs?: number;
 }
 
 export interface LanguageServerProcessInfo {

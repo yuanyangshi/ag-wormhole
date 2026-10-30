@@ -207,13 +207,18 @@ while IFS= read -r TARGET; do
             error_log "Target is already an intercepted wrapper, but backup does not exist!"
             continue
         fi
+        if [ ! -s "$TARGET" ]; then
+            error_log "Target $TARGET is empty or invalid, skipping backup!"
+            continue
+        fi
         mv "$TARGET" "$BAK"
         info_log "Atomic backup created: $BAK"
     else
         debug_log "Backup confirmed: $BAK"
     fi
 
-cat > "$TARGET" << 'WRAPPER_EOF'
+    WRAPPER_TMP="${TARGET}.tmp.$$"
+    cat > "$WRAPPER_TMP" << 'WRAPPER_EOF'
 #!/bin/bash
 # ============================================================================
 # AG-Wormhole - Syscall Redirection Sandbox Wrapper
@@ -228,6 +233,11 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 PROXY_ADDR="__PROXY_ADDR_PLACEHOLDER__"
 PROXY_TYPE="__PROXY_TYPE_PLACEHOLDER__"
 EXTENSION_BIN_PATH="__EXTENSION_BIN_PATH_PLACEHOLDER__"
+
+if [ ! -f "$SCRIPT_DIR/$SCRIPT_NAME.bak" ]; then
+    echo "[AG-Wormhole][FATAL] Backup binary $SCRIPT_DIR/$SCRIPT_NAME.bak not found!" >&2
+    exit 1
+fi
 
 find_binaries() {
     local arch=$(uname -m)
@@ -293,19 +303,20 @@ else
 fi
 WRAPPER_EOF
 
-    sed -i "s|__PROXY_ADDR_PLACEHOLDER__|$PROXY_ADDR|g" "$TARGET"
-    sed -i "s|__PROXY_TYPE_PLACEHOLDER__|$PROXY_TYPE|g" "$TARGET"
-    sed -i "s|__EXTENSION_VERSION_PLACEHOLDER__|$EXTENSION_VERSION|g" "$TARGET"
-    sed -i "s|__TIMESTAMP_PLACEHOLDER__|$(date -Iseconds)|g" "$TARGET"
+    sed -i "s|__PROXY_ADDR_PLACEHOLDER__|$PROXY_ADDR|g" "$WRAPPER_TMP"
+    sed -i "s|__PROXY_TYPE_PLACEHOLDER__|$PROXY_TYPE|g" "$WRAPPER_TMP"
+    sed -i "s|__EXTENSION_VERSION_PLACEHOLDER__|$EXTENSION_VERSION|g" "$WRAPPER_TMP"
+    sed -i "s|__TIMESTAMP_PLACEHOLDER__|$(date -Iseconds)|g" "$WRAPPER_TMP"
     
     if [ -n "$EXTENSION_PATH" ]; then
         EXTENSION_BIN_DIR="$EXTENSION_PATH/resources/bin"
-        sed -i "s|__EXTENSION_BIN_PATH_PLACEHOLDER__|$EXTENSION_BIN_DIR|g" "$TARGET"
+        sed -i "s|__EXTENSION_BIN_PATH_PLACEHOLDER__|$EXTENSION_BIN_DIR|g" "$WRAPPER_TMP"
     else
-        sed -i "s|__EXTENSION_BIN_PATH_PLACEHOLDER__||g" "$TARGET"
+        sed -i "s|__EXTENSION_BIN_PATH_PLACEHOLDER__||g" "$WRAPPER_TMP"
     fi
 
-    chmod +x "$TARGET"
+    chmod +x "$WRAPPER_TMP"
+    mv -f "$WRAPPER_TMP" "$TARGET"
     info_log "Interception sandbox injected successfully"
     info_log "  Target: $TARGET"
     info_log "  Endpoint: $PROXY_ADDR ($PROXY_TYPE)"

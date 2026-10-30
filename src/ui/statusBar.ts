@@ -31,43 +31,59 @@ export class StatusBarController implements vscode.Disposable {
 
     public update(status: ProxyStatus): void {
         const isLocal = status.runningLocation === 'local';
-        let text = '$(plug) Wormhole: ';
+        let icon = '🟢';
+        let label = 'AGW';
         let tooltip = 'AG-Wormhole Control Center\n\n';
 
         if (isLocal) {
-            tooltip += `Location: Local\n`;
+            tooltip += `Role: Local Control Plane\n`;
             tooltip += `SSH Reverse Forwarding: ${status.sshConfigEnabled ? 'Active' : 'Disabled'}\n`;
             tooltip += `Local Proxy (127.0.0.1:${status.localProxyPort}): ${status.localProxyReachable ? 'Reachable' : 'Unreachable'}\n`;
 
             if (status.sshConfigEnabled && status.localProxyReachable) {
-                text += `$(check) Local Active (Port ${status.remoteProxyPort})`;
+                icon = '🟢';
+                this.statusBarItem.color = '#73c991';
                 this.statusBarItem.backgroundColor = undefined;
+                tooltip += `Status: Healthy (Forwarding Port ${status.remoteProxyPort})\n`;
             } else if (!status.sshConfigEnabled) {
-                text += `$(circle-slash) Disabled`;
+                icon = '⚪';
+                this.statusBarItem.color = '#8c8c8c';
                 this.statusBarItem.backgroundColor = undefined;
+                tooltip += `Status: Forwarding Disabled\n`;
             } else {
-                text += `$(warning) Proxy Unreachable`;
-                this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                icon = '🟡';
+                this.statusBarItem.color = '#e2c08d';
+                this.statusBarItem.backgroundColor = undefined;
+                tooltip += `Status: Local Proxy Unreachable\n`;
             }
         } else {
-            tooltip += `Location: Remote\n`;
+            tooltip += `Role: Remote Data Plane\n`;
             tooltip += `Ingress Endpoint (${status.remoteProxyHost}:${status.remoteProxyPort}): ${status.remoteProxyReachable ? 'Reachable' : 'Unreachable'}\n`;
+            if (status.isRelaying) {
+                tooltip += `Tunnel Bridge: Active (Auto-bridged via port ${status.activeTunnelPort})\n`;
+            }
             tooltip += `Language Server Interception: ${status.languageServerConfigured ? 'Injected' : 'Pending'}\n`;
 
             if (status.remoteProxyReachable && status.languageServerConfigured) {
-                text += `$(check) Remote Active`;
+                icon = '🟢';
+                this.statusBarItem.color = '#73c991';
                 this.statusBarItem.backgroundColor = undefined;
+                tooltip += `Status: Active & Connected${status.isRelaying ? ` (Relayed via :${status.activeTunnelPort})` : ''}\n`;
             } else if (status.remoteProxyReachable && !status.languageServerConfigured) {
-                text += `$(gear) Setup Pending`;
-                this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                icon = '🟡';
+                this.statusBarItem.color = '#e2c08d';
+                this.statusBarItem.backgroundColor = undefined;
+                tooltip += `Status: Setup Pending\n`;
             } else {
-                text += `$(error) Ingress Offline`;
-                this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+                icon = '🔴';
+                this.statusBarItem.color = '#f14c4c';
+                this.statusBarItem.backgroundColor = undefined;
+                tooltip += `Status: Ingress Offline\n`;
             }
         }
 
         tooltip += `\nClick to open AG-Wormhole Dashboard`;
-        this.statusBarItem.text = text;
+        this.statusBarItem.text = `${icon} ${label}`;
         this.statusBarItem.tooltip = tooltip;
     }
 

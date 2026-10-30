@@ -1,8 +1,8 @@
 # AG-Wormhole
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Engine: VS Code](https://img.shields.io/badge/VS%20Code-%5E1.100.0-informational.svg)](https://code.visualstudio.com/)
-[![Architecture: Dual--Plane](https://img.shields.io/badge/Architecture-Dual--Plane-teal.svg)](#system-architecture)
+[![Engine: VS Code](https://img.shields.io/badge/VS_Code-1.100.0+-informational.svg)](https://code.visualstudio.com/)
+[![Architecture: Dual-Plane](https://img.shields.io/badge/Architecture-Dual--Plane-teal.svg)](#system-architecture)
 
 **AG-Wormhole** is a zero-privilege, dual-plane proxy tunnel and syscall redirection sandbox engineered for seamless remote development in constrained network environments. It bridges isolated remote developer compute nodes with local or designated upstream proxy gateways without requiring root privileges, iptables tampering, or global system-wide environment pollution.
 
@@ -61,8 +61,8 @@ flowchart LR
         R_Watchdog -.->|Health Probe & Port Reclaim| R_SSHD
     end
 
-    L_SSH <==>|Encrypted SSH Wormhole (Hardened KeepAlive)| R_SSHD
-    L_Proxy ==>|Uplink Requests| Internet(("Global Internet / AI Services"))
+    L_SSH <-->|"Encrypted SSH Wormhole (Hardened KeepAlive)"| R_SSHD
+    L_Proxy ==>|"Uplink Requests"| Internet(("Global Internet / AI Services"))
 ```
 
 ---
@@ -115,6 +115,7 @@ All configurations are scoped under the `ag-wormhole` namespace:
 | `ag-wormhole.proxyType` | `string` | `"http"` | Gateway protocol (`http` or `socks5`). |
 | `ag-wormhole.watchdogInterval` | `number` | `10` | Watchdog health probe interval in seconds (3 to 60s). |
 | `ag-wormhole.autoReclaimPort` | `boolean` | `true` | Automatically terminate zombie processes occupying remote port on failure. |
+| `ag-wormhole.autoInjectTerminalProxy` | `boolean` | `true` | Automatically inject proxy environment variables (http_proxy, https_proxy, all_proxy) into remote integrated terminals. |
 | `ag-wormhole.showStatusOnStartup` | `boolean` | `true` | Show status notification upon connecting to a remote server. |
 
 ---

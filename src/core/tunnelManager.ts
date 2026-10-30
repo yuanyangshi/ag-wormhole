@@ -39,6 +39,82 @@ export class TunnelManager {
     }
 
     /**
+     * Perform lightweight application-level (L7) health check without external traffic overhead.
+     * Verifies that the proxy process is actively accepting and parsing protocol frames.
+     */
+    public static async checkProxyL7(
+        host: string,
+        port: number,
+        proxyType: string = 'http',
+        timeoutMs: number = 2500
+    ): Promise<{ ok: boolean; message: string }> {
+        return new Promise((resolve) => {
+            const socket = new net.Socket();
+            let resolved = false;
+
+            const finalize = (ok: boolean, message: string) => {
+                if (resolved) {
+                    return;
+                }
+                resolved = true;
+                socket.removeAllListeners();
+                socket.destroy();
+                resolve({ ok, message });
+            };
+
+            socket.setTimeout(timeoutMs);
+
+            socket.on('connect', () => {
+                try {
+                    if (proxyType.toLowerCase() === 'socks5') {
+                        // SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0 (No Auth)
+                        socket.write(Buffer.from([0x05, 0x01, 0x00]));
+                    } else {
+                        // Minimal HTTP probe frame
+                        socket.write('HEAD http://127.0.0.1:0/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+                    }
+                } catch (err: unknown) {
+                    const e = err as { message?: string };
+                    finalize(false, `Failed to write L7 probe frame: ${e.message}`);
+                }
+            });
+
+            socket.on('data', (data) => {
+                if (proxyType.toLowerCase() === 'socks5') {
+                    if (data.length >= 2 && data[0] === 0x05) {
+                        finalize(true, 'SOCKS5 proxy responded with valid greeting handshake');
+                    } else {
+                        finalize(false, `Unexpected response byte from SOCKS5 listener (0x${data[0]?.toString(16)})`);
+                    }
+                } else {
+                    const resp = data.toString('utf-8');
+                    if (resp.startsWith('HTTP/')) {
+                        finalize(true, 'HTTP proxy returned valid status line');
+                    } else {
+                        finalize(false, 'Non-HTTP response received from proxy gateway');
+                    }
+                }
+            });
+
+            socket.on('timeout', () => {
+                finalize(false, `L7 proxy handshake timed out after ${timeoutMs}ms`);
+            });
+
+            socket.on('error', (err) => {
+                finalize(false, `L7 socket connection error: ${err.message}`);
+            });
+
+            socket.on('close', () => {
+                if (!resolved) {
+                    finalize(false, 'Socket closed before L7 handshake response was received');
+                }
+            });
+
+            socket.connect(port, host);
+        });
+    }
+
+    /**
      * Synchronize local SSH port forwarding according to VS Code configuration
      */
     public static async syncLocalForwarding(): Promise<{ enabled: boolean; localPort: number; remotePort: number }> {

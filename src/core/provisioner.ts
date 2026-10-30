@@ -2,7 +2,6 @@
  * AG-Wormhole - Remote Provisioning & Sandbox Engine
  */
 
-import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
@@ -212,9 +211,14 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
      * Terminate dead or zombie processes holding the remote proxy port
      */
     public static async reclaimPort(port: number): Promise<{ success: boolean; message: string; pidsKilled: number[] }> {
+        if (!port || port <= 0 || port > 65535) {
+            return { success: false, message: `Invalid port ${port}`, pidsKilled: [] };
+        }
+
         const pidsKilled: number[] = [];
         try {
             let pidsRaw = '';
+            // Strategy 1: lsof or fuser
             try {
                 const { stdout } = await execAsync(`lsof -t -i :${port} 2>/dev/null || fuser ${port}/tcp 2>/dev/null || true`);
                 pidsRaw = stdout.trim();
@@ -222,11 +226,27 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 // Ignore failure
             }
 
+            // Strategy 2: Fallback to ss socket inspection (present in standard iproute2 on minimal containers)
+            if (!pidsRaw) {
+                try {
+                    const { stdout } = await execAsync(`ss -lptn "sport = :${port}" 2>/dev/null || true`);
+                    const matches = stdout.match(/pid=(\d+)/g);
+                    if (matches) {
+                        pidsRaw = matches.map(m => m.replace('pid=', '')).join(' ');
+                    }
+                } catch {
+                    // Ignore ss failure
+                }
+            }
+
             if (!pidsRaw) {
                 return { success: true, message: `No active process holding port ${port}`, pidsKilled: [] };
             }
 
-            const pids = pidsRaw.split(/\s+/).map(p => parseInt(p, 10)).filter(p => !isNaN(p) && p > 0);
+            const pids = Array.from(new Set(
+                pidsRaw.split(/\s+/).map(p => parseInt(p, 10)).filter(p => !isNaN(p) && p > 0)
+            ));
+
             for (const pid of pids) {
                 if (pid === process.pid || pid === process.ppid) {
                     continue;
@@ -242,7 +262,9 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             logger.log(`Port ${port} reclaimed. Terminated zombie PIDs: ${pidsKilled.join(', ')}`, false);
             return {
                 success: true,
-                message: `Successfully released port ${port} (terminated ${pidsKilled.length} process(es))`,
+                message: pidsKilled.length > 0
+                    ? `Successfully released port ${port} (terminated ${pidsKilled.length} process(es))`
+                    : `No releasable processes holding port ${port}`,
                 pidsKilled
             };
         } catch (err: unknown) {

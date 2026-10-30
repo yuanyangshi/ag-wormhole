@@ -46,6 +46,8 @@ suite('SSHConfigManager Unit Tests', () => {
         assert.ok(wormholeContent.includes('ConnectTimeout 15'), 'Must enforce ConnectTimeout');
         assert.ok(wormholeContent.includes('ConnectionAttempts 3'), 'Must enforce ConnectionAttempts');
         assert.ok(wormholeContent.includes('StreamLocalBindUnlink yes'), 'Must enforce StreamLocalBindUnlink');
+        assert.ok(wormholeContent.includes('Compression no'), 'Must disable compression for TLS streams');
+        assert.ok(wormholeContent.includes('Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com'), 'Must configure optimized ciphers');
         assert.ok(mainContent.includes(WORMHOLE_SSH_INCLUDE_LINE));
     });
 
