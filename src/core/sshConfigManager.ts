@@ -60,14 +60,14 @@ export class SSHConfigManager {
                     '    ServerAliveInterval 15',
                     '    ServerAliveCountMax 3',
                     '    TCPKeepAlive yes',
-                    '    IPQoS lowdelay throughput',
+                    '    IPQoS none',
                     '    ConnectTimeout 15',
                     '    ConnectionAttempts 3',
                     '    StreamLocalBindUnlink yes',
                     '    ExitOnForwardFailure no',
                     '    VisualHostKey no',
                     '    Compression no',
-                    '    Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com',
+                    '    Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr',
                     '',
                 ].join('\n');
 

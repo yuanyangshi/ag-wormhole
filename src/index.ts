@@ -81,7 +81,10 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
         };
     } else {
         const watchdogMetrics = TunnelWatchdog.getInstance().getMetrics();
-        const remoteReachable = await TunnelManager.checkPortAvailable(remoteHost, remotePort);
+        const isWatchdogFresh = (Date.now() - watchdogMetrics.lastChecked.getTime()) < 15000;
+        const remoteReachable = isWatchdogFresh
+            ? (watchdogMetrics.state === 'HEALTHY' || watchdogMetrics.state === 'DEGRADED')
+            : await TunnelManager.checkPortAvailable(remoteHost, remotePort);
         const lsProcess = await Provisioner.getLanguageServerProcess();
         const isMgraftcpRunning = await Provisioner.isMgraftcpRunning();
 

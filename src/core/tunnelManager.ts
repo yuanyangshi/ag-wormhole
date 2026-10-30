@@ -18,22 +18,24 @@ export class TunnelManager {
     /**
      * Test TCP connectivity to specified endpoint
      */
-    public static async checkPortAvailable(host: string, port: number, timeoutMs: number = 2000): Promise<boolean> {
+    public static async checkPortAvailable(host: string, port: number, timeoutMs: number = 2500): Promise<boolean> {
         return new Promise((resolve) => {
             const socket = new net.Socket();
+            let settled = false;
+            const done = (result: boolean) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                socket.removeAllListeners();
+                socket.end();
+                socket.destroy();
+                resolve(result);
+            };
             socket.setTimeout(timeoutMs);
-            socket.on('connect', () => {
-                socket.destroy();
-                resolve(true);
-            });
-            socket.on('timeout', () => {
-                socket.destroy();
-                resolve(false);
-            });
-            socket.on('error', () => {
-                socket.destroy();
-                resolve(false);
-            });
+            socket.on('connect', () => done(true));
+            socket.on('timeout', () => done(false));
+            socket.on('error', () => done(false));
             socket.connect(port, host);
         });
     }
@@ -46,7 +48,7 @@ export class TunnelManager {
         host: string,
         port: number,
         proxyType: string = 'http',
-        timeoutMs: number = 2500
+        timeoutMs: number = 3000
     ): Promise<{ ok: boolean; message: string }> {
         return new Promise((resolve) => {
             const socket = new net.Socket();
@@ -58,6 +60,7 @@ export class TunnelManager {
                 }
                 resolved = true;
                 socket.removeAllListeners();
+                socket.end();
                 socket.destroy();
                 resolve({ ok, message });
             };
@@ -70,8 +73,8 @@ export class TunnelManager {
                         // SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0 (No Auth)
                         socket.write(Buffer.from([0x05, 0x01, 0x00]));
                     } else {
-                        // Minimal HTTP probe frame
-                        socket.write('HEAD http://127.0.0.1:0/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+                        // Minimal local HTTP parser probe (avoids outbound dial errors in Clash/V2Ray logs)
+                        socket.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
                     }
                 } catch (err: unknown) {
                     const e = err as { message?: string };

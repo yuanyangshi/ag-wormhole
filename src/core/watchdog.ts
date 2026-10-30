@@ -46,8 +46,11 @@ export class TunnelWatchdog {
     private timer?: NodeJS.Timeout;
     private metrics: WatchdogMetrics;
     private stateChangeCallbacks: ((metrics: WatchdogMetrics) => void)[] = [];
+    private isProbing = false;
+    private probeCount = 0;
     private readonly checkIntervalMs = 10000; // 10s non-intrusive probe
-    private readonly failureThreshold = 2; // trigger recovery after 2 consecutive failures
+    private readonly failureThreshold = 3; // trigger recovery after 3 consecutive failures
+    private readonly reclaimCooldownMs = 60000; // minimum 60s between automatic port reclaim attempts
 
     private constructor() {
         this.metrics = {
@@ -114,116 +117,155 @@ export class TunnelWatchdog {
      * Actively probe tunnel endpoints and handle degradation
      */
     public async probe(): Promise<WatchdogMetrics> {
+        if (this.isProbing) {
+            return this.getMetrics();
+        }
+        this.isProbing = true;
+        this.probeCount++;
         this.metrics.lastChecked = new Date();
 
-        let remoteHost = DEFAULT_PROXY_HOST;
-        let remotePort = DEFAULT_PROXY_PORT;
-        let localPort = DEFAULT_PROXY_PORT;
-        let proxyType = DEFAULT_PROXY_TYPE;
-
         try {
-            const vscode = require('vscode');
-            const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-            remoteHost = config.get(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
-            remotePort = config.get(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
-            localPort = config.get(CFG_LOCAL_PROXY_PORT, DEFAULT_PROXY_PORT);
-            proxyType = config.get(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
-        } catch {
-            // Fallback for non-vscode standalone execution
-        }
+            let remoteHost = DEFAULT_PROXY_HOST;
+            let remotePort = DEFAULT_PROXY_PORT;
+            let localPort = DEFAULT_PROXY_PORT;
+            let proxyType = DEFAULT_PROXY_TYPE;
 
-        let isReachable = false;
-        const targetHost = isRunningRemotely() ? remoteHost : '127.0.0.1';
-        const targetPort = isRunningRemotely() ? remotePort : localPort;
+            try {
+                const vscode = require('vscode');
+                const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+                remoteHost = config.get(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
+                remotePort = config.get(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
+                localPort = config.get(CFG_LOCAL_PROXY_PORT, DEFAULT_PROXY_PORT);
+                proxyType = config.get(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
+            } catch {
+                // Fallback for non-vscode standalone execution
+            }
 
-        if (isRunningRemotely()) {
-            isReachable = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 2000);
-        } else {
-            isReachable = await TunnelManager.checkPortAvailable('127.0.0.1', localPort, 2000);
-        }
+            const relayInfo = IngressRelay.getInstance().getRelayInfo();
+            const probePort = (isRunningRemotely() && relayInfo.isRelaying && relayInfo.targetPort)
+                ? relayInfo.targetPort
+                : (isRunningRemotely() ? remotePort : localPort);
+            const targetHost = isRunningRemotely() ? remoteHost : '127.0.0.1';
 
-        let l7Result: { ok: boolean; message: string } | undefined;
-        if (isReachable) {
-            l7Result = await TunnelManager.checkProxyL7(targetHost, targetPort, proxyType, 2000);
-        }
+            const isReachable = await TunnelManager.checkPortAvailable(targetHost, probePort, 2500);
 
-        // Autonomous Reconnect Recovery:
-        // If primary remote port is unavailable or degraded (e.g. following an abrupt SSH disconnect/reconnect),
-        // check whether OpenSSH bound to one of the fallback ports in the resilience pool.
-        if (isRunningRemotely() && (!isReachable || !l7Result?.ok)) {
-            const fallbackPorts = [remotePort + 1, remotePort + 2];
-            for (const fp of fallbackPorts) {
-                const fpReachable = await TunnelManager.checkPortAvailable(remoteHost, fp, 1500);
-                if (fpReachable) {
-                    const fpL7 = await TunnelManager.checkProxyL7(remoteHost, fp, proxyType, 1500);
-                    if (fpL7.ok) {
-                        logger.log(`Tunnel Watchdog: Detected active fallback SSH tunnel on port ${fp}. Auto-healing primary port ${remotePort}...`, false);
-                        await Provisioner.reclaimPort(remotePort);
-                        const relaySuccess = await IngressRelay.getInstance().startRelay(remotePort, fp);
-                        if (relaySuccess) {
-                            isReachable = true;
-                            l7Result = { ok: true, message: `Relayed via active tunnel port ${fp}` };
-                            this.metrics.activeTunnelPort = fp;
-                            this.metrics.isRelaying = true;
-                            break;
+            let l7Result: { ok: boolean; message: string } | undefined;
+            if (isReachable) {
+                const shouldRunL7 =
+                    this.metrics.state !== 'HEALTHY' ||
+                    this.metrics.l7Health === undefined ||
+                    this.probeCount % 6 === 1;
+
+                if (shouldRunL7) {
+                    l7Result = await TunnelManager.checkProxyL7(targetHost, probePort, proxyType, 3000);
+                } else {
+                    l7Result = {
+                        ok: true,
+                        message: this.metrics.l7Message || 'Proxy tunnel active'
+                    };
+                }
+            }
+
+            // Autonomous Reconnect Recovery:
+            // If primary remote port is unavailable (or held by a dead zombie sshd from a previous session
+            // while a new sshd bound to one of the fallback ports), bridge traffic via IngressRelay.
+            if (isRunningRemotely() && (!isReachable || !l7Result?.ok)) {
+                const primaryPids = isReachable ? await Provisioner.getListeningPids(remotePort) : [];
+                const fallbackPorts = [remotePort + 1, remotePort + 2];
+
+                for (const fp of fallbackPorts) {
+                    if (fp === probePort && !isReachable) {
+                        continue;
+                    }
+                    const fpPids = await Provisioner.getListeningPids(fp);
+                    // If primary port is reachable and owned by the exact same live sshd PID as the fallback port,
+                    // it is NOT a zombie collision; skip failover to avoid disrupting the active session.
+                    const sharesSameOwner =
+                        primaryPids.length > 0 &&
+                        fpPids.length > 0 &&
+                        primaryPids.some(pid => fpPids.includes(pid));
+
+                    if (sharesSameOwner) {
+                        continue;
+                    }
+
+                    const fpReachable = await TunnelManager.checkPortAvailable(remoteHost, fp, 2000);
+                    if (fpReachable) {
+                        const fpL7 = await TunnelManager.checkProxyL7(remoteHost, fp, proxyType, 2500);
+                        if (fpL7.ok) {
+                            logger.log(`Tunnel Watchdog: Detected active fallback SSH tunnel on port ${fp}. Auto-healing primary port ${remotePort}...`, false);
+                            await Provisioner.reclaimPort(remotePort);
+                            const relaySuccess = await IngressRelay.getInstance().startRelay(remotePort, fp);
+                            if (relaySuccess) {
+                                l7Result = { ok: true, message: `Relayed via active tunnel port ${fp}` };
+                                this.metrics.activeTunnelPort = fp;
+                                this.metrics.isRelaying = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if (isReachable && l7Result?.ok) {
-            this.metrics.l7Health = true;
-            this.metrics.l7Message = l7Result.message;
-            this.metrics.activeTunnelPort = this.metrics.activeTunnelPort || (isRunningRemotely() ? remotePort : localPort);
-            this.metrics.isRelaying = IngressRelay.getInstance().isRelaying();
+            const effectiveReachable = isReachable || Boolean(this.metrics.isRelaying && l7Result?.ok);
 
-            const wasDisconnected = this.metrics.state === 'DISCONNECTED';
-            if (this.metrics.state !== 'HEALTHY') {
-                logger.log(`Tunnel Watchdog: Connection verified HEALTHY (Port ${this.metrics.activeTunnelPort}${this.metrics.isRelaying ? ' via bridge' : ''})`, isRunningLocally());
-            }
-            this.metrics.consecutiveFailures = 0;
-            this.metrics.state = 'HEALTHY';
-            this.metrics.reconnectPromptShown = false;
+            if (effectiveReachable && l7Result?.ok) {
+                this.metrics.l7Health = true;
+                this.metrics.l7Message = l7Result.message;
+                this.metrics.activeTunnelPort = IngressRelay.getInstance().isRelaying()
+                    ? IngressRelay.getInstance().getRelayInfo().targetPort
+                    : (isRunningRemotely() ? remotePort : localPort);
+                this.metrics.isRelaying = IngressRelay.getInstance().isRelaying();
 
-            if (wasDisconnected && isRunningLocally()) {
-                // Auto-sync when local gateway is brought back online
-                try {
-                    await TunnelManager.syncLocalForwarding();
-                    const vscode = require('vscode');
-                    vscode.window.showInformationMessage(
-                        `[AG-Wormhole] Local proxy listener at 127.0.0.1:${localPort} recovered! Tunnel synchronized.`
-                    );
-                } catch {
-                    // Non-extension environment
+                const wasDisconnected = this.metrics.state === 'DISCONNECTED';
+                if (this.metrics.state !== 'HEALTHY') {
+                    logger.log(`Tunnel Watchdog: Connection verified HEALTHY (Port ${this.metrics.activeTunnelPort}${this.metrics.isRelaying ? ' via bridge' : ''})`, isRunningLocally());
                 }
-            }
-        } else if (isReachable && !l7Result?.ok) {
-            this.metrics.l7Health = false;
-            this.metrics.l7Message = l7Result?.message || 'L7 handshake failed';
-            this.metrics.state = 'DEGRADED';
-            logger.log(`Tunnel Watchdog: Port open but L7 proxy probe degraded: ${this.metrics.l7Message}`, isRunningLocally());
-        } else {
-            this.metrics.l7Health = false;
-            this.metrics.l7Message = 'All ingress tunnel ports unreachable';
-            this.metrics.consecutiveFailures++;
-            if (this.metrics.consecutiveFailures >= this.failureThreshold) {
-                this.metrics.state = 'DISCONNECTED';
-                await this.handleTunnelDisconnection(remotePort);
-            } else {
+                this.metrics.consecutiveFailures = 0;
+                this.metrics.state = 'HEALTHY';
+                this.metrics.reconnectPromptShown = false;
+
+                if (wasDisconnected && isRunningLocally()) {
+                    // Auto-sync when local gateway is brought back online
+                    try {
+                        await TunnelManager.syncLocalForwarding();
+                        const vscode = require('vscode');
+                        vscode.window.showInformationMessage(
+                            `[AG-Wormhole] Local proxy listener at 127.0.0.1:${localPort} recovered! Tunnel synchronized.`
+                        );
+                    } catch {
+                        // Non-extension environment
+                    }
+                }
+            } else if (effectiveReachable && !l7Result?.ok) {
+                this.metrics.l7Health = false;
+                this.metrics.l7Message = l7Result?.message || 'L7 handshake failed';
                 this.metrics.state = 'DEGRADED';
+                logger.log(`Tunnel Watchdog: Port open but L7 proxy probe degraded: ${this.metrics.l7Message}`, isRunningLocally());
+            } else {
+                this.metrics.l7Health = false;
+                this.metrics.l7Message = 'All ingress tunnel ports unreachable';
+                this.metrics.consecutiveFailures++;
+                if (this.metrics.consecutiveFailures >= this.failureThreshold) {
+                    this.metrics.state = 'DISCONNECTED';
+                    await this.handleTunnelDisconnection(remotePort);
+                } else {
+                    this.metrics.state = 'DEGRADED';
+                }
+                logger.log(
+                    `Tunnel Watchdog probe failed (consecutive failures: ${this.metrics.consecutiveFailures})`,
+                    isRunningLocally()
+                );
             }
-            logger.log(
-                `Tunnel Watchdog probe failed (consecutive failures: ${this.metrics.consecutiveFailures})`,
-                isRunningLocally()
-            );
-        }
 
-        for (const cb of this.stateChangeCallbacks) {
-            cb(this.getMetrics());
-        }
+            for (const cb of this.stateChangeCallbacks) {
+                cb(this.getMetrics());
+            }
 
-        return this.getMetrics();
+            return this.getMetrics();
+        } finally {
+            this.isProbing = false;
+        }
     }
 
     /**
@@ -240,8 +282,12 @@ export class TunnelWatchdog {
                 // Default true
             }
 
-            // Attempt autonomous zombie port reclamation on remote failure
-            if (autoReclaim) {
+            const now = Date.now();
+            const lastAttemptMs = this.metrics.lastRecoveryAttempt?.getTime() ?? 0;
+            const cooldownElapsed = now - lastAttemptMs >= this.reclaimCooldownMs;
+
+            // Attempt autonomous zombie port reclamation on remote failure (respecting cooldown)
+            if (autoReclaim && cooldownElapsed) {
                 this.metrics.lastRecoveryAttempt = new Date();
                 logger.log(`Tunnel Watchdog: Autonomous self-healing triggered for remote port ${remotePort}`, false);
                 const result = await Provisioner.reclaimPort(remotePort);
@@ -250,9 +296,9 @@ export class TunnelWatchdog {
                 }
             }
 
-            // Show reconnect notification only after prolonged outage (>= 4 probes, ~40s)
+            // Show reconnect notification only after prolonged outage (>= 5 probes, ~50s)
             // to allow transient SSH auto-reconnect and IngressRelay recovery without disruption.
-            if (this.metrics.consecutiveFailures >= 4 && !this.metrics.reconnectPromptShown) {
+            if (this.metrics.consecutiveFailures >= 5 && !this.metrics.reconnectPromptShown) {
                 this.metrics.reconnectPromptShown = true;
                 try {
                     const vscode = require('vscode');

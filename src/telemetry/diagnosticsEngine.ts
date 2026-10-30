@@ -140,7 +140,7 @@ export class DiagnosticsEngine {
             } else {
                 let zombieInfo = '';
                 try {
-                    const { stdout } = await execAsync(`lsof -i :${port} -t 2>/dev/null || fuser ${port}/tcp 2>/dev/null || true`);
+                    const { stdout } = await execAsync(`lsof -nP -t -iTCP:${port} -sTCP:LISTEN 2>/dev/null || true`);
                     if (stdout.trim().length > 0) {
                         zombieInfo = ` (Port is occupied by process PID: ${stdout.trim()})`;
                     }

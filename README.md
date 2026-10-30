@@ -16,13 +16,13 @@ To prevent frequent SSH tunnel disconnects, dead socket locks, and silent forwar
 - **Bidirectional Heartbeats**: Injects `ServerAliveInterval 15` and `ServerAliveCountMax 3` into `~/.ssh/config.wormhole`, preventing NAT routers and stateful firewalls from terminating idle connections.
 - **Deadlock Mitigation**: Sets `ConnectTimeout 15` and `ConnectionAttempts 3` to prevent infinite hangs during network blackouts and automatically retries transient handshakes.
 - **Socket Unlink on Bind**: Configures `StreamLocalBindUnlink yes` and `ExitOnForwardFailure no` so that stale socket files do not trigger port binding collisions or crash the SSH session.
-- **Priority Routing**: Injects `IPQoS lowdelay throughput` to ensure low-latency packet prioritization across congested network links.
+- **Middlebox DSCP Safety**: Configures `IPQoS none` and hardware-accelerated AEAD/CTR cipher suites (`chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr`) to prevent stateful firewalls, VPNs, and Wi-Fi routers from dropping DSCP-marked SSH packets mid-session.
 - **Multiplexing Recommendations**: Supports SSH connection multiplexing (`ControlMaster auto`, `ControlPersist 10m`) to maintain persistent master sockets across window reloads.
 
 ### 2. Autonomous Watchdog & Self-Healing Engine (`TunnelWatchdog`)
-- **Active Probes**: Probes tunnel endpoints every 10 seconds (configurable via `ag-wormhole.watchdogInterval`) using a 3-state health model (`HEALTHY`, `DEGRADED`, `DISCONNECTED`).
+- **Low-Overhead Probes**: Probes tunnel endpoints every 10 seconds (configurable via `ag-wormhole.watchdogInterval`) using a 3-state health model (`HEALTHY`, `DEGRADED`, `DISCONNECTED`) with throttled L7 validation to prevent SSH `forwarded-tcpip` channel storms.
 - **Local Gateway Auto-Reconnection**: Automatically detects when local proxy software (Clash, V2Ray, Mihomo) goes online, immediately triggering SSH reverse tunnel synchronization.
-- **Remote Zombie Port Auto-Reclaim**: When connection loss is detected and `ag-wormhole.autoReclaimPort` is enabled, the watchdog autonomously terminates orphan processes locking the remote proxy port, eliminating the classic `Address already in use` silent failure.
+- **Session-Safe Zombie Port Auto-Reclaim**: When connection loss is detected and `ag-wormhole.autoReclaimPort` is enabled, the watchdog inspects strictly `LISTEN`-state sockets, protects the active `sshd` ancestor tree and live child sessions, and selectively terminates only orphaned zombie processes locking the remote proxy port.
 
 ### 3. Linux Kernel TCP KeepAlive Diagnostics
 - Audits remote Linux system `/proc/sys/net/ipv4/tcp_keepalive_time` to prevent the default 7200-second (2-hour) TCP dead socket persistence during client network drops.

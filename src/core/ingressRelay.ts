@@ -45,21 +45,32 @@ export class IngressRelay {
         await this.stopRelay();
 
         return new Promise((resolve) => {
-            const server = net.createServer({ pauseOnConnect: false }, (clientSocket) => {
+            const server = net.createServer({ pauseOnConnect: true }, (clientSocket) => {
                 const targetSocket = new net.Socket();
+                clientSocket.setNoDelay(true);
+                clientSocket.setKeepAlive(true, 15000);
+                targetSocket.setNoDelay(true);
+                targetSocket.setKeepAlive(true, 15000);
 
                 targetSocket.connect(targetPort, '127.0.0.1', () => {
                     clientSocket.pipe(targetSocket);
                     targetSocket.pipe(clientSocket);
+                    clientSocket.resume();
                 });
 
-                const errorHandler = () => {
-                    clientSocket.destroy();
-                    targetSocket.destroy();
+                const cleanup = () => {
+                    if (!clientSocket.destroyed) {
+                        clientSocket.destroy();
+                    }
+                    if (!targetSocket.destroyed) {
+                        targetSocket.destroy();
+                    }
                 };
 
-                clientSocket.on('error', errorHandler);
-                targetSocket.on('error', errorHandler);
+                clientSocket.on('error', cleanup);
+                targetSocket.on('error', cleanup);
+                clientSocket.on('close', cleanup);
+                targetSocket.on('close', cleanup);
             });
 
             server.on('error', (err: { message?: string }) => {

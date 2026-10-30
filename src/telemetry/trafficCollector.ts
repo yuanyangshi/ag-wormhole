@@ -2,16 +2,14 @@
  * AG-Wormhole - Traffic Collector & Metrics Engine
  */
 
-import * as net from 'net';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { TrafficStats } from '../shared/types';
 import { isRunningRemotely } from '../shared/environment';
+import { TunnelWatchdog } from '../core/watchdog';
 import {
     CONFIG_SECTION,
-    CFG_REMOTE_PROXY_HOST,
     CFG_REMOTE_PROXY_PORT,
-    DEFAULT_PROXY_HOST,
     DEFAULT_PROXY_PORT
 } from '../shared/constants';
 
@@ -25,7 +23,8 @@ export class TrafficCollector {
     private updateCallbacks: StatsUpdateCallback[] = [];
     private peakConnections: number = 0;
     private lastConnections: number = 0;
-    private readonly refreshIntervalMs: number = 2000;
+    private isCollecting: boolean = false;
+    private readonly refreshIntervalMs: number = 5000;
 
     constructor() {
         this.stats = {
@@ -86,35 +85,45 @@ export class TrafficCollector {
     }
 
     private async collect(): Promise<void> {
-        let remoteProxyHost = DEFAULT_PROXY_HOST;
-        let remoteProxyPort = DEFAULT_PROXY_PORT;
+        if (this.isCollecting) {
+            return;
+        }
+        this.isCollecting = true;
+
         try {
-            const vscode = require('vscode');
-            const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-            remoteProxyHost = config.get(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
-            remoteProxyPort = config.get(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
-        } catch {
-            // Standalone test context
-        }
+            let remoteProxyPort = DEFAULT_PROXY_PORT;
+            try {
+                const vscode = require('vscode');
+                const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+                remoteProxyPort = config.get(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
+            } catch {
+                // Standalone test context
+            }
 
-        this.stats.proxyReachable = await this.checkPort(remoteProxyHost, remoteProxyPort);
-        const { activeConnections, avgRttMs } = await this.getConnectionMetrics(remoteProxyPort);
+            const watchdogMetrics = TunnelWatchdog.getInstance().getMetrics();
+            const targetPort = watchdogMetrics.activeTunnelPort || remoteProxyPort;
+            this.stats.proxyReachable = watchdogMetrics.state !== 'DISCONNECTED';
 
-        if (activeConnections > this.lastConnections) {
-            this.stats.totalConnectionsSeen += (activeConnections - this.lastConnections);
-        }
-        if (activeConnections > this.peakConnections) {
-            this.peakConnections = activeConnections;
-        }
-        this.lastConnections = activeConnections;
+            const { activeConnections, avgRttMs } = await this.getConnectionMetrics(targetPort);
 
-        this.stats.activeConnections = activeConnections;
-        this.stats.peakConnections = this.peakConnections;
-        this.stats.avgRttMs = avgRttMs;
-        this.stats.lastUpdated = new Date();
+            if (activeConnections > this.lastConnections) {
+                this.stats.totalConnectionsSeen += (activeConnections - this.lastConnections);
+            }
+            if (activeConnections > this.peakConnections) {
+                this.peakConnections = activeConnections;
+            }
+            this.lastConnections = activeConnections;
 
-        for (const callback of this.updateCallbacks) {
-            callback(this.getStats());
+            this.stats.activeConnections = activeConnections;
+            this.stats.peakConnections = this.peakConnections;
+            this.stats.avgRttMs = avgRttMs;
+            this.stats.lastUpdated = new Date();
+
+            for (const callback of this.updateCallbacks) {
+                callback(this.getStats());
+            }
+        } finally {
+            this.isCollecting = false;
         }
     }
 
@@ -147,26 +156,6 @@ export class TrafficCollector {
         } catch {
             return { activeConnections: 0 };
         }
-    }
-
-    private checkPort(host: string, port: number): Promise<boolean> {
-        return new Promise((resolve) => {
-            const socket = new net.Socket();
-            socket.setTimeout(2000);
-            socket.on('connect', () => {
-                socket.destroy();
-                resolve(true);
-            });
-            socket.on('timeout', () => {
-                socket.destroy();
-                resolve(false);
-            });
-            socket.on('error', () => {
-                socket.destroy();
-                resolve(false);
-            });
-            socket.connect(port, host);
-        });
     }
 
     public getSessionDuration(): string {

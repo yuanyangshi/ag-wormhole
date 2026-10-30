@@ -18,6 +18,13 @@ suite('Resilience & Stability Unit Tests', () => {
         assert.strictEqual(overflowPort.success, false);
     });
 
+    test('Provisioner.getProtectedPids protects active process and parent hierarchy', async () => {
+        const protectedSet = await Provisioner.getProtectedPids(7890);
+        assert.strictEqual(protectedSet.has(1), true);
+        assert.strictEqual(protectedSet.has(process.pid), true);
+        assert.strictEqual(protectedSet.has(process.ppid), true);
+    });
+
     test('TunnelManager.checkProxyL7 correctly validates mock HTTP proxy', async () => {
         // Spin up temporary mock HTTP proxy listener
         const server = net.createServer((socket) => {
