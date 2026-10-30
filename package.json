@@ -124,6 +124,12 @@
           "scope": "machine-overridable",
           "description": "Automatically clear zombie sockets and dead processes occupying the remote proxy port upon failure."
         },
+        "ag-wormhole.autoInjectTerminalProxy": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine-overridable",
+          "description": "Automatically inject proxy environment variables (http_proxy, https_proxy, all_proxy) into remote integrated terminals."
+        },
         "ag-wormhole.proxyType": {
           "type": "string",
           "default": "http",

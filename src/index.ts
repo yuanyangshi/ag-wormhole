@@ -15,6 +15,7 @@ import {
     CFG_REMOTE_PROXY_PORT,
     CFG_SHOW_STATUS_ON_STARTUP,
     CFG_PROXY_TYPE,
+    CFG_AUTO_INJECT_TERMINAL_PROXY,
     DEFAULT_PROXY_PORT,
     DEFAULT_PROXY_HOST,
     DEFAULT_PROXY_TYPE,
@@ -36,6 +37,7 @@ import {
 import { SSHConfigManager } from './core/sshConfigManager';
 import { TunnelManager } from './core/tunnelManager';
 import { Provisioner } from './core/provisioner';
+import { IngressRelay } from './core/ingressRelay';
 import { TrafficCollector } from './telemetry/trafficCollector';
 import { StatusBarController } from './ui/statusBar';
 import { StatusPanel } from './ui/statusPanel';
@@ -78,6 +80,7 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
             lastUpdated: new Date()
         };
     } else {
+        const watchdogMetrics = TunnelWatchdog.getInstance().getMetrics();
         const remoteReachable = await TunnelManager.checkPortAvailable(remoteHost, remotePort);
         const lsProcess = await Provisioner.getLanguageServerProcess();
         const isMgraftcpRunning = await Provisioner.isMgraftcpRunning();
@@ -89,8 +92,10 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
             remoteProxyPort: remotePort,
             remoteProxyHost: remoteHost,
             localProxyReachable: false,
-            remoteProxyReachable: remoteReachable,
+            remoteProxyReachable: remoteReachable || watchdogMetrics.state === 'HEALTHY',
             languageServerConfigured: lsProcess?.isUsingProxy || isMgraftcpRunning,
+            activeTunnelPort: watchdogMetrics.activeTunnelPort || remotePort,
+            isRelaying: watchdogMetrics.isRelaying,
             lastUpdated: new Date()
         };
     }
@@ -194,6 +199,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await refreshAllStatus();
     }, AUTO_REFRESH_INTERVAL_SEC * 1000);
 
+    // Instant probe on window focus (recovers instantly after laptop sleep or SSH reconnect)
+    context.subscriptions.push(
+        vscode.window.onDidChangeWindowState(async (e) => {
+            if (e.focused) {
+                await watchdog.probe();
+                await refreshAllStatus();
+            }
+        })
+    );
+
     await refreshAllStatus();
 }
 
@@ -286,11 +301,38 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
                 const h = cfg.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
                 const p = cfg.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
                 const t = cfg.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
+                const inject = cfg.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
+                if (inject && context.environmentVariableCollection) {
+                    const proxyUrl = `http://${h}:${p}`;
+                    const allProxyUrl = `${t}://${h}:${p}`;
+                    context.environmentVariableCollection.replace('http_proxy', proxyUrl);
+                    context.environmentVariableCollection.replace('https_proxy', proxyUrl);
+                    context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
+                    context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
+                    context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
+                    context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
+                } else if (!inject && context.environmentVariableCollection) {
+                    context.environmentVariableCollection.clear();
+                }
                 await Provisioner.runSetupSilently(h, p, t, extensionPath);
                 await refreshAllStatus();
             }
         })
     );
+
+    // Auto-inject terminal proxy environment variables if enabled
+    const autoInjectTerminal = config.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
+    if (autoInjectTerminal && context.environmentVariableCollection) {
+        const proxyUrl = `http://${remoteHost}:${remotePort}`;
+        const allProxyUrl = `${proxyType}://${remoteHost}:${remotePort}`;
+        context.environmentVariableCollection.replace('http_proxy', proxyUrl);
+        context.environmentVariableCollection.replace('https_proxy', proxyUrl);
+        context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
+        context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
+        context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
+        context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
+        logger.log(`Injected proxy environment variables into remote terminals: ${proxyUrl}`, false);
+    }
 
     // Auto-setup silently
     await Provisioner.runSetupSilently(remoteHost, remotePort, proxyType, extensionPath);
@@ -322,6 +364,7 @@ export async function deactivate(): Promise<void> {
         clearInterval(autoRefreshTimer);
     }
     TunnelWatchdog.getInstance().stop();
+    await IngressRelay.getInstance().stopRelay();
     trafficCollector?.stop();
     logger.log('AG-Wormhole deactivated.', isRunningLocally());
 }

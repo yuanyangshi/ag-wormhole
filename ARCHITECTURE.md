@@ -44,8 +44,8 @@ graph TB
         Telemetry -.->|Socket Inspection| Ingress
     end
 
-    SSH_Conf <===> SSH_Wire
-    SSH_Wire <===> Ingress
+    SSH_Conf <--> SSH_Wire
+    SSH_Wire <--> Ingress
 ```
 
 ---

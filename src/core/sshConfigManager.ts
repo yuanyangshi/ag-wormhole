@@ -44,11 +44,19 @@ export class SSHConfigManager {
 
             if (enable) {
                 // 1. Write the dedicated wormhole sub-config with high-availability keepalive parameters
+                // Forward primary port and fallback ports (remotePort + 1, remotePort + 2) to eliminate
+                // reconnection failure when primary port is temporarily held by dead zombie sockets.
+                const forwardLines = [
+                    `    RemoteForward ${remotePort} 127.0.0.1:${localPort}`,
+                    `    RemoteForward ${remotePort + 1} 127.0.0.1:${localPort}`,
+                    `    RemoteForward ${remotePort + 2} 127.0.0.1:${localPort}`,
+                ];
+
                 const content = [
                     '# AG-Wormhole High-Availability SSH Tunnel Configuration',
                     `# Generated at: ${new Date().toISOString()}`,
                     'Match all',
-                    `    RemoteForward ${remotePort} 127.0.0.1:${localPort}`,
+                    ...forwardLines,
                     '    ServerAliveInterval 15',
                     '    ServerAliveCountMax 3',
                     '    TCPKeepAlive yes',
@@ -58,6 +66,8 @@ export class SSHConfigManager {
                     '    StreamLocalBindUnlink yes',
                     '    ExitOnForwardFailure no',
                     '    VisualHostKey no',
+                    '    Compression no',
+                    '    Ciphers chacha20-poly1305@openssh.com,aes128-gcm@openssh.com',
                     '',
                 ].join('\n');
 

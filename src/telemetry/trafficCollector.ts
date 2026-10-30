@@ -2,7 +2,6 @@
  * AG-Wormhole - Traffic Collector & Metrics Engine
  */
 
-import * as vscode from 'vscode';
 import * as net from 'net';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -25,6 +24,7 @@ export class TrafficCollector {
     private refreshInterval: NodeJS.Timeout | undefined;
     private updateCallbacks: StatsUpdateCallback[] = [];
     private peakConnections: number = 0;
+    private lastConnections: number = 0;
     private readonly refreshIntervalMs: number = 2000;
 
     constructor() {
@@ -33,7 +33,8 @@ export class TrafficCollector {
             totalConnectionsSeen: 0,
             sessionStartTime: new Date(),
             lastUpdated: new Date(),
-            proxyReachable: false
+            proxyReachable: false,
+            peakConnections: 0
         };
     }
 
@@ -58,14 +59,21 @@ export class TrafficCollector {
         }
     }
 
-    public onUpdate(callback: StatsUpdateCallback): vscode.Disposable {
+    public onUpdate(callback: StatsUpdateCallback): { dispose(): void } {
         this.updateCallbacks.push(callback);
-        return new vscode.Disposable(() => {
-            const index = this.updateCallbacks.indexOf(callback);
-            if (index >= 0) {
-                this.updateCallbacks.splice(index, 1);
+        return {
+            dispose: () => {
+                const index = this.updateCallbacks.indexOf(callback);
+                if (index >= 0) {
+                    this.updateCallbacks.splice(index, 1);
+                }
             }
-        });
+        };
+    }
+
+    public dispose(): void {
+        this.stop();
+        this.updateCallbacks = [];
     }
 
     public getStats(): TrafficStats {
@@ -78,22 +86,31 @@ export class TrafficCollector {
     }
 
     private async collect(): Promise<void> {
-        const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-        const remoteProxyHost = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
-        const remoteProxyPort = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
-
-        this.stats.proxyReachable = await this.checkPort(remoteProxyHost, remoteProxyPort);
-        const activeConnections = await this.getActiveConnections(remoteProxyPort);
-
-        if (activeConnections > this.peakConnections) {
-            this.stats.totalConnectionsSeen += (activeConnections - this.peakConnections);
-            this.peakConnections = activeConnections;
-        } else if (activeConnections < this.peakConnections) {
-            this.stats.totalConnectionsSeen += this.peakConnections - activeConnections;
-            this.peakConnections = activeConnections;
+        let remoteProxyHost = DEFAULT_PROXY_HOST;
+        let remoteProxyPort = DEFAULT_PROXY_PORT;
+        try {
+            const vscode = require('vscode');
+            const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+            remoteProxyHost = config.get(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
+            remoteProxyPort = config.get(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
+        } catch {
+            // Standalone test context
         }
 
+        this.stats.proxyReachable = await this.checkPort(remoteProxyHost, remoteProxyPort);
+        const { activeConnections, avgRttMs } = await this.getConnectionMetrics(remoteProxyPort);
+
+        if (activeConnections > this.lastConnections) {
+            this.stats.totalConnectionsSeen += (activeConnections - this.lastConnections);
+        }
+        if (activeConnections > this.peakConnections) {
+            this.peakConnections = activeConnections;
+        }
+        this.lastConnections = activeConnections;
+
         this.stats.activeConnections = activeConnections;
+        this.stats.peakConnections = this.peakConnections;
+        this.stats.avgRttMs = avgRttMs;
         this.stats.lastUpdated = new Date();
 
         for (const callback of this.updateCallbacks) {
@@ -101,16 +118,34 @@ export class TrafficCollector {
         }
     }
 
-    private async getActiveConnections(port: number): Promise<number> {
+    private async getConnectionMetrics(port: number): Promise<{ activeConnections: number; avgRttMs?: number }> {
         try {
             const { stdout } = await execAsync(
-                `ss -tn state established '( dport = :${port} or sport = :${port} )' 2>/dev/null | tail -n +2 | wc -l`,
+                `ss -tin state established '( dport = :${port} or sport = :${port} )' 2>/dev/null`,
                 { timeout: 5000 }
             );
-            const count = parseInt(stdout.trim(), 10);
-            return isNaN(count) ? 0 : count;
+            const trimmed = stdout.trim();
+            if (!trimmed) {
+                return { activeConnections: 0 };
+            }
+
+            const lines = trimmed.split('\n');
+            const socketLines = lines.filter(l => l.includes(`:${port}`));
+            const activeConnections = socketLines.length;
+
+            const rttMatches = stdout.match(/rtt:([\d.]+)/g);
+            let avgRttMs: number | undefined;
+            if (rttMatches && rttMatches.length > 0) {
+                const totalRtt = rttMatches.reduce((acc, curr) => {
+                    const val = parseFloat(curr.replace('rtt:', ''));
+                    return acc + (isNaN(val) ? 0 : val);
+                }, 0);
+                avgRttMs = Math.round((totalRtt / rttMatches.length) * 10) / 10;
+            }
+
+            return { activeConnections, avgRttMs };
         } catch {
-            return 0;
+            return { activeConnections: 0 };
         }
     }
 
@@ -144,11 +179,6 @@ export class TrafficCollector {
         const seconds = diffSec % 60;
 
         return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-    }
-
-    public dispose(): void {
-        this.stop();
-        this.updateCallbacks = [];
     }
 }
 
