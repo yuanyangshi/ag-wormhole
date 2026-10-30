@@ -47,10 +47,10 @@ export class Provisioner {
      */
     public static async getLanguageServerProcess(): Promise<LanguageServerProcessInfo | null> {
         try {
-            const { stdout } = await execAsync('ps aux | grep language_server_linux | grep -v grep');
+            const { stdout } = await execAsync('ps auxww | grep language_server_linux | grep -v grep');
             const lines = stdout.trim().split('\n').filter(l => l.length > 0);
 
-            const hasMgraftcpWrapper = lines.some(line => line.includes('mgraftcp'));
+            const hasMgraftcpWrapper = lines.some(line => line.includes('mgraftcp')) || await Provisioner.isMgraftcpRunning();
 
             for (const line of lines) {
                 if (line.includes('mgraftcp-fakedns')) {
@@ -61,11 +61,12 @@ export class Provisioner {
                     if (parts.length >= 2) {
                         const pid = parseInt(parts[1], 10);
                         const isPersistent = line.includes('--persistent_mode') || line.includes('persistent_mode');
+                        const isBakBinary = line.includes('.bak');
                         if (!isNaN(pid)) {
                             return {
                                 pid,
                                 isPersistent,
-                                isUsingProxy: hasMgraftcpWrapper
+                                isUsingProxy: hasMgraftcpWrapper || isBakBinary
                             };
                         }
                     }
@@ -208,6 +209,128 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
     }
 
     /**
+     * Retrieve PIDs actively listening (LISTEN state only) on a given TCP port
+     */
+    public static async getListeningPids(port: number): Promise<number[]> {
+        if (!port || port <= 0 || port > 65535) {
+            return [];
+        }
+
+        let pidsRaw = '';
+        // Strategy 1: lsof filtered strictly to TCP LISTEN state (never match client connections)
+        try {
+            const { stdout } = await execAsync(`lsof -nP -t -iTCP:${port} -sTCP:LISTEN 2>/dev/null || true`);
+            pidsRaw = stdout.trim();
+        } catch {
+            // Ignore failure
+        }
+
+        // Strategy 2: Fallback to ss listening socket inspection (-l restricts to LISTEN)
+        if (!pidsRaw) {
+            try {
+                const { stdout } = await execAsync(`ss -lptn "sport = :${port}" 2>/dev/null || true`);
+                const matches = stdout.match(/pid=(\d+)/g);
+                if (matches) {
+                    pidsRaw = matches.map(m => m.replace('pid=', '')).join(' ');
+                }
+            } catch {
+                // Ignore ss failure
+            }
+        }
+
+        if (!pidsRaw) {
+            return [];
+        }
+
+        return Array.from(new Set(
+            pidsRaw.split(/\s+/).map(p => parseInt(p, 10)).filter(p => !isNaN(p) && p > 0)
+        ));
+    }
+
+    /**
+     * Collect all ancestor PIDs of the current Extension Host up to PID 1
+     * to prevent terminating the active SSH daemon or remote IDE server tree.
+     */
+    public static async getProtectedPids(port: number): Promise<Set<number>> {
+        const protectedPids = new Set<number>([1, process.pid, process.ppid]);
+
+        // 1. Walk ancestor chain via /proc or ps
+        let currentPid = process.pid;
+        for (let depth = 0; depth < 16 && currentPid > 1; depth++) {
+            protectedPids.add(currentPid);
+            try {
+                const statContent = await fs.readFile(`/proc/${currentPid}/stat`, 'utf-8');
+                const closeParenIdx = statContent.lastIndexOf(')');
+                if (closeParenIdx !== -1) {
+                    const fields = statContent.slice(closeParenIdx + 2).trim().split(/\s+/);
+                    const ppid = parseInt(fields[1], 10);
+                    if (!isNaN(ppid) && ppid > 0 && !protectedPids.has(ppid)) {
+                        currentPid = ppid;
+                        continue;
+                    }
+                }
+                break;
+            } catch {
+                break;
+            }
+        }
+
+        // 2. Protect any PID that is also listening on fallback ports (port + 1, port + 2),
+        // because if the same sshd owns both primary and fallback ports, it is the LIVE session.
+        const fallbackPorts = [port + 1, port + 2].filter(p => p > 0 && p <= 65535);
+        for (const fp of fallbackPorts) {
+            const fpPids = await Provisioner.getListeningPids(fp);
+            for (const fpPid of fpPids) {
+                protectedPids.add(fpPid);
+            }
+        }
+
+        return protectedPids;
+    }
+
+    /**
+     * Check whether a candidate PID is a safe-to-reclaim orphaned zombie tunnel process
+     */
+    private static async isSafeZombieCandidate(pid: number, protectedPids: Set<number>): Promise<boolean> {
+        if (protectedPids.has(pid)) {
+            return false;
+        }
+
+        try {
+            const { stdout: cmdOut } = await execAsync(`ps -p ${pid} -o comm=,args= 2>/dev/null || true`);
+            const cmdLine = cmdOut.trim().toLowerCase();
+            if (!cmdLine) {
+                return false;
+            }
+
+            // Never terminate IDE server, extension host, or proxy wrapper processes
+            if (
+                cmdLine.includes('node') ||
+                cmdLine.includes('code') ||
+                cmdLine.includes('antigravity') ||
+                cmdLine.includes('language_server') ||
+                cmdLine.includes('mgraftcp')
+            ) {
+                return false;
+            }
+
+            // If it is an sshd process, verify it has no live child processes (shells/servers).
+            // An orphaned sshd holding a dead RemoteForward port has zero active child processes.
+            if (cmdLine.includes('sshd')) {
+                const { stdout: childrenOut } = await execAsync(`pgrep -P ${pid} 2>/dev/null || true`);
+                if (childrenOut.trim().length > 0) {
+                    logger.log(`Skipping active sshd session (PID ${pid}) with live child processes`, false);
+                    return false;
+                }
+            }
+
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
      * Terminate dead or zombie processes holding the remote proxy port
      */
     public static async reclaimPort(port: number): Promise<{ success: boolean; message: string; pidsKilled: number[] }> {
@@ -217,41 +340,22 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
 
         const pidsKilled: number[] = [];
         try {
-            let pidsRaw = '';
-            // Strategy 1: lsof or fuser
-            try {
-                const { stdout } = await execAsync(`lsof -t -i :${port} 2>/dev/null || fuser ${port}/tcp 2>/dev/null || true`);
-                pidsRaw = stdout.trim();
-            } catch {
-                // Ignore failure
-            }
-
-            // Strategy 2: Fallback to ss socket inspection (present in standard iproute2 on minimal containers)
-            if (!pidsRaw) {
-                try {
-                    const { stdout } = await execAsync(`ss -lptn "sport = :${port}" 2>/dev/null || true`);
-                    const matches = stdout.match(/pid=(\d+)/g);
-                    if (matches) {
-                        pidsRaw = matches.map(m => m.replace('pid=', '')).join(' ');
-                    }
-                } catch {
-                    // Ignore ss failure
-                }
-            }
-
-            if (!pidsRaw) {
+            const pids = await Provisioner.getListeningPids(port);
+            if (pids.length === 0) {
                 return { success: true, message: `No active process holding port ${port}`, pidsKilled: [] };
             }
 
-            const pids = Array.from(new Set(
-                pidsRaw.split(/\s+/).map(p => parseInt(p, 10)).filter(p => !isNaN(p) && p > 0)
-            ));
+            const protectedPids = await Provisioner.getProtectedPids(port);
 
             for (const pid of pids) {
-                if (pid === process.pid || pid === process.ppid) {
+                const isSafe = await Provisioner.isSafeZombieCandidate(pid, protectedPids);
+                if (!isSafe) {
+                    logger.log(`Protected active process PID ${pid} on port ${port} from termination`, false);
                     continue;
                 }
                 try {
+                    await execAsync(`kill -15 ${pid} 2>/dev/null || true`);
+                    await new Promise(resolve => setTimeout(resolve, 200));
                     await execAsync(`kill -9 ${pid} 2>/dev/null || true`);
                     pidsKilled.push(pid);
                 } catch {
@@ -259,12 +363,14 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 }
             }
 
-            logger.log(`Port ${port} reclaimed. Terminated zombie PIDs: ${pidsKilled.join(', ')}`, false);
+            if (pidsKilled.length > 0) {
+                logger.log(`Port ${port} reclaimed. Terminated zombie PIDs: ${pidsKilled.join(', ')}`, false);
+            }
             return {
                 success: true,
                 message: pidsKilled.length > 0
-                    ? `Successfully released port ${port} (terminated ${pidsKilled.length} process(es))`
-                    : `No releasable processes holding port ${port}`,
+                    ? `Successfully released port ${port} (terminated ${pidsKilled.length} zombie process(es))`
+                    : `No zombie processes holding port ${port} (active session protected)`,
                 pidsKilled
             };
         } catch (err: unknown) {
