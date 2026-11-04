@@ -373,6 +373,28 @@ export class StatusPanel {
 <body>
     <div class="header">
         <div class="title-group">
+            <svg width="28" height="28" viewBox="0 0 512 512" fill="none" style="filter: drop-shadow(0 0 6px rgba(0, 242, 254, 0.45)); vertical-align: middle;">
+                <rect x="24" y="24" width="464" height="464" rx="104" fill="#0d111a" stroke="url(#dashBorder)" stroke-width="6"/>
+                <defs>
+                    <linearGradient id="dashBorder" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" stop-color="#00f2fe"/>
+                        <stop offset="50%" stop-color="#7928ca"/>
+                        <stop offset="100%" stop-color="#ff0080"/>
+                    </linearGradient>
+                    <linearGradient id="dashCyan" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" stop-color="#38ef7d"/>
+                        <stop offset="100%" stop-color="#00f2fe"/>
+                    </linearGradient>
+                    <linearGradient id="dashViolet" x1="100%" y1="0%" x2="0%" y2="100%">
+                        <stop offset="0%" stop-color="#ff0080"/>
+                        <stop offset="100%" stop-color="#7928ca"/>
+                    </linearGradient>
+                </defs>
+                <path d="M 256 100 C 342 100, 412 170, 412 256 C 412 320, 370 375, 310 398 C 260 417, 205 400, 172 362 C 140 326, 142 272, 176 238 C 206 208, 256 208, 286 238" fill="none" stroke="url(#dashCyan)" stroke-width="28" stroke-linecap="round"/>
+                <path d="M 256 412 C 170 412, 100 342, 100 256 C 100 192, 142 137, 202 114 C 252 95, 307 112, 340 150 C 372 186, 370 240, 336 274 C 306 304, 256 304, 226 274" fill="none" stroke="url(#dashViolet)" stroke-width="28" stroke-linecap="round"/>
+                <circle cx="256" cy="256" r="42" fill="#ffffff" opacity="0.95"/>
+                <circle cx="256" cy="256" r="70" fill="#00f2fe" opacity="0.25"/>
+            </svg>
             <h1 class="title">AG-Wormhole</h1>
             <span class="badge badge-mode">${isLocal ? 'Local Mode' : 'Remote Mode'}</span>
             <span class="badge ${isOnline ? 'badge-online' : 'badge-offline'}">${isOnline ? 'Active' : 'Degraded'}</span>

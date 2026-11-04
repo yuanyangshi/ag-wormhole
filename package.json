@@ -4,6 +4,7 @@
   "displayName": "AG-Wormhole (Zero-Privilege Proxy Tunnel)",
   "description": "High-performance zero-privilege dual-plane proxy tunnel and syscall redirection sandbox for Antigravity remote development environments.",
   "version": "1.0.0",
+  "icon": "resources/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/ag-wormhole/ag-wormhole"

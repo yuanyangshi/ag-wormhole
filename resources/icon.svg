@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background Gradient -->
+    <radialGradient id="bgGrad" cx="50%" cy="35%" r="70%">
+      <stop offset="0%" stop-color="#161b26"/>
+      <stop offset="60%" stop-color="#0b0f19"/>
+      <stop offset="100%" stop-color="#05070b"/>
+    </radialGradient>
+
+    <!-- Border Glow Gradient -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f2fe" stop-opacity="0.8"/>
+      <stop offset="50%" stop-color="#7928ca" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#ff0080" stop-opacity="0.8"/>
+    </linearGradient>
+
+    <!-- Wormhole Ring 1 (Local to Remote: Cyan-Blue) -->
+    <linearGradient id="ringCyan" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38ef7d"/>
+      <stop offset="40%" stop-color="#11998e"/>
+      <stop offset="80%" stop-color="#00f2fe"/>
+      <stop offset="100%" stop-color="#4facfe"/>
+    </linearGradient>
+
+    <!-- Wormhole Ring 2 (Remote to Local: Violet-Magenta) -->
+    <linearGradient id="ringViolet" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ff0080"/>
+      <stop offset="50%" stop-color="#7928ca"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+
+    <!-- Energy Singularity Core -->
+    <radialGradient id="singularityCore" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="35%" stop-color="#a5f3fc"/>
+      <stop offset="70%" stop-color="#06b6d4" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#083344" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Glow Filters -->
+    <filter id="hyperGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="8" result="blur1"/>
+      <feGaussianBlur stdDeviation="20" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Base Squircle Container -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bgGrad)"/>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="url(#borderGrad)" stroke-width="3" stroke-opacity="0.65"/>
+
+  <!-- Subtle Galactic Grid Pattern (Spatial Horizon) -->
+  <g opacity="0.08" stroke="#ffffff" stroke-width="1.2">
+    <circle cx="256" cy="256" r="190" fill="none" stroke-dasharray="4 8"/>
+    <circle cx="256" cy="256" r="140" fill="none" stroke-dasharray="3 6"/>
+    <circle cx="256" cy="256" r="90" fill="none" stroke-dasharray="2 4"/>
+    <line x1="66" y1="256" x2="446" y2="256"/>
+    <line x1="256" y1="66" x2="256" y2="446"/>
+  </g>
+
+  <!-- Deep Wormhole Spatial Warp Rays -->
+  <g opacity="0.4" filter="url(#softGlow)">
+    <path d="M 120 256 Q 256 220 392 256 Q 256 292 120 256 Z" fill="none" stroke="#00f2fe" stroke-width="1.5" stroke-dasharray="6 6"/>
+    <path d="M 256 120 Q 220 256 256 392 Q 292 256 256 120 Z" fill="none" stroke="#ff0080" stroke-width="1.5" stroke-dasharray="6 6"/>
+  </g>
+
+  <!-- Primary Wormhole Ring (Dual-Plane Swirl: Plane A / Local) -->
+  <g filter="url(#hyperGlow)">
+    <!-- Swirl Arm 1 -->
+    <path d="M 256 100
+             C 342 100, 412 170, 412 256
+             C 412 320, 370 375, 310 398
+             C 260 417, 205 400, 172 362
+             C 140 326, 142 272, 176 238
+             C 206 208, 256 208, 286 238
+             C 304 256, 304 286, 286 304
+             C 272 318, 250 318, 236 304"
+          fill="none"
+          stroke="url(#ringCyan)"
+          stroke-width="18"
+          stroke-linecap="round"/>
+
+    <!-- Swirl Arm 2 (Inverse Gravitational Horizon: Plane B / Remote) -->
+    <path d="M 256 412
+             C 170 412, 100 342, 100 256
+             C 100 192, 142 137, 202 114
+             C 252 95, 307 112, 340 150
+             C 372 186, 370 240, 336 274
+             C 306 304, 256 304, 226 274
+             C 208 256, 208 226, 226 208
+             C 240 194, 262 194, 276 208"
+          fill="none"
+          stroke="url(#ringViolet)"
+          stroke-width="18"
+          stroke-linecap="round"/>
+  </g>
+
+  <!-- Tunnel Transit Data Packets (Photon Impulses) -->
+  <g filter="url(#softGlow)">
+    <circle cx="165" cy="180" r="5" fill="#38ef7d"/>
+    <circle cx="347" cy="332" r="5" fill="#00f2fe"/>
+    <circle cx="365" cy="165" r="5" fill="#ff0080"/>
+    <circle cx="147" cy="347" r="5" fill="#a855f7"/>
+    <circle cx="256" cy="100" r="7" fill="#ffffff"/>
+    <circle cx="256" cy="412" r="7" fill="#ffffff"/>
+  </g>
+
+  <!-- Wormhole Event Horizon Singularity (Center Core) -->
+  <circle cx="256" cy="256" r="46" fill="url(#singularityCore)" filter="url(#hyperGlow)"/>
+  <circle cx="256" cy="256" r="16" fill="#ffffff" filter="url(#softGlow)"/>
+
+  <!-- Antigravity Dimensional Convergence Sparks -->
+  <polygon points="256,236 261,251 276,256 261,261 256,276 251,261 236,256 251,251" fill="#ffffff"/>
+</svg>
+
