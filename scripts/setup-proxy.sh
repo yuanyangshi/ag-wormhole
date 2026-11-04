@@ -17,9 +17,12 @@ set -e
 #   DEBUG             - Set to 1 for verbose diagnostics
 # ============================================================================
 
-PROXY_HOST="${PROXY_HOST:-__PROXY_HOST__}"
-PROXY_PORT="${PROXY_PORT:-__PROXY_PORT__}"
-PROXY_TYPE="${PROXY_TYPE:-__PROXY_TYPE__}"
+PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
+[ "$PROXY_HOST" = "__PROXY_HOST__" ] && PROXY_HOST="127.0.0.1"
+PROXY_PORT="${PROXY_PORT:-7890}"
+[ "$PROXY_PORT" = "__PROXY_PORT__" ] && PROXY_PORT="7890"
+PROXY_TYPE="${PROXY_TYPE:-http}"
+[ "$PROXY_TYPE" = "__PROXY_TYPE__" ] && PROXY_TYPE="http"
 EXTENSION_PATH="${EXTENSION_PATH:-}"
 EXTENSION_VERSION="${EXTENSION_VERSION:-1.0.0}"
 PROXY_ADDR="${PROXY_HOST}:${PROXY_PORT}"
@@ -117,6 +120,29 @@ info_log "Discovered Workspace: $SERVER_DIR"
 # Helper Functions
 # ============================================================================
 
+export_proxy_env_helper() {
+    local env_dir="$HOME/.ag-wormhole"
+    mkdir -p "$env_dir"
+    local env_file="$env_dir/proxy.env"
+    local env_tmp="${env_file}.tmp.$$"
+    cat > "$env_tmp" << EOF
+# AG-Wormhole Environment Variables
+# Source this file in tmux, screen, nohup, or external terminal sessions:
+#   source ~/.ag-wormhole/proxy.env
+export http_proxy="http://${PROXY_ADDR}"
+export https_proxy="http://${PROXY_ADDR}"
+export HTTP_PROXY="http://${PROXY_ADDR}"
+export HTTPS_PROXY="http://${PROXY_ADDR}"
+export all_proxy="${PROXY_TYPE}://${PROXY_ADDR}"
+export ALL_PROXY="${PROXY_TYPE}://${PROXY_ADDR}"
+export no_proxy="localhost,127.0.0.1,::1"
+export NO_PROXY="localhost,127.0.0.1,::1"
+EOF
+    mv -f "$env_tmp" "$env_file"
+    chmod 644 "$env_file" 2>/dev/null || true
+    info_log "Synchronized external session environment helper: $env_file"
+}
+
 get_wrapper_version() {
     local wrapper="$1"
     grep -oP 'WRAPPER_VERSION="\K[^"]+' "$wrapper" 2>/dev/null || echo "none"
@@ -189,6 +215,7 @@ if [ -z "$TARGETS" ]; then
 STATE_EOF
         mv -f "$STATE_TMP" "$STATE_FILE"
         info_log "Synchronized AGY runtime proxy state: $STATE_FILE"
+        export_proxy_env_helper
         echo ""
         echo "================================================================="
         echo " AG-Wormhole: Provisioning Summary"
@@ -372,6 +399,10 @@ if [ $SKIPPED_COUNT -gt 0 ]; then
     echo "  Skipped: $SKIPPED_COUNT wrapper(s) already synchronized"
 fi
 echo "================================================================="
+
+if [ $CONFIGURED_COUNT -gt 0 ] || [ $SKIPPED_COUNT -gt 0 ]; then
+    export_proxy_env_helper
+fi
 
 if [ $CONFIGURED_COUNT -gt 0 ]; then
     echo ""

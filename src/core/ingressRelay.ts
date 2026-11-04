@@ -35,6 +35,22 @@ export class IngressRelay {
     }
 
     /**
+     * Temporarily suspend the relay for a brief duration (yielding the listening port)
+     * and allow inspection or takeover by the native SSH daemon.
+     */
+    public async yieldPort(durationMs: number = 250): Promise<void> {
+        if (!this.isRelaying()) {
+            return;
+        }
+        const currentTarget = this.targetPort;
+        const currentListen = this.listeningPort;
+        await this.stopRelay();
+        if (durationMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, durationMs));
+        }
+    }
+
+    /**
      * Start local TCP bridge forwarding all traffic from listenPort to active targetPort
      */
     public async startRelay(listenPort: number, targetPort: number): Promise<boolean> {

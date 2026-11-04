@@ -5,6 +5,7 @@
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
+import * as net from 'net';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { logger } from '../shared/logger';
@@ -346,12 +347,24 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             }
         }
 
-        // 2. Protect active dedicated background keeper listener on port+3
+        // 2. Protect active dedicated background keeper listener on port+3 ONLY if verified alive.
+        // If the keeper port has an orphaned listener without an active uplink, allow it to be reclaimed.
         const keeperPort = port + 3;
         if (keeperPort > 0 && keeperPort <= 65535) {
-            const keeperPids = await Provisioner.getListeningPids(keeperPort);
-            for (const pid of keeperPids) {
-                protectedPids.add(pid);
+            const isKeeperPortAlive = await new Promise<boolean>((resolve) => {
+                const s = new net.Socket();
+                s.setTimeout(800);
+                s.on('connect', () => { s.destroy(); resolve(true); });
+                s.on('timeout', () => { s.destroy(); resolve(false); });
+                s.on('error', () => { s.destroy(); resolve(false); });
+                s.connect(keeperPort, '127.0.0.1');
+            });
+
+            if (isKeeperPortAlive) {
+                const keeperPids = await Provisioner.getListeningPids(keeperPort);
+                for (const pid of keeperPids) {
+                    protectedPids.add(pid);
+                }
             }
         }
 
@@ -460,7 +473,7 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
      */
     public static async reclaimPortRange(
         basePort: number,
-        count: number = 3
+        count: number = 4
     ): Promise<{ success: boolean; message: string; pidsKilled: number[] }> {
         const allKilled: number[] = [];
         for (let i = 0; i < count; i++) {

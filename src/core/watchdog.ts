@@ -142,6 +142,31 @@ export class TunnelWatchdog {
                 // Fallback for non-vscode standalone execution
             }
 
+            // Autonomous Relay Yielding & Native Port Reclaim Probe:
+            // When traffic is being bridged via a fallback port, periodically yield IngressRelay
+            // to allow any newly connected SSH session to re-bind the primary native port.
+            if (isRunningRemotely() && IngressRelay.getInstance().isRelaying() && this.probeCount % 5 === 0) {
+                const targetFp = IngressRelay.getInstance().getRelayInfo().targetPort;
+                await IngressRelay.getInstance().stopRelay();
+                await new Promise((r) => setTimeout(r, 200));
+
+                const nativeReachable = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 1500);
+                let nativeHealthy = false;
+                if (nativeReachable) {
+                    const primaryL7 = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 2000);
+                    nativeHealthy = primaryL7.ok;
+                }
+
+                if (nativeHealthy) {
+                    logger.log(`Tunnel Watchdog: Native primary SSH tunnel restored on port ${remotePort}. Reclaimed successfully from bridge relay.`, false);
+                    this.metrics.isRelaying = false;
+                    this.metrics.activeTunnelPort = remotePort;
+                } else if (targetFp) {
+                    // Native primary port not yet ready, immediately restore the bridge
+                    await IngressRelay.getInstance().startRelay(remotePort, targetFp);
+                }
+            }
+
             const relayInfo = IngressRelay.getInstance().getRelayInfo();
             const probePort = (isRunningRemotely() && relayInfo.isRelaying && relayInfo.targetPort)
                 ? relayInfo.targetPort
@@ -303,11 +328,11 @@ export class TunnelWatchdog {
             const cooldownElapsed = now - lastAttemptMs >= this.reclaimCooldownMs;
 
             // Attempt autonomous zombie port reclamation on remote failure (respecting cooldown)
-            // Automatically clears all ports across the forwarding cluster
+            // Automatically clears all ports across the forwarding cluster (primary, fallbacks, and keeper)
             if (autoReclaim && cooldownElapsed) {
                 this.metrics.lastRecoveryAttempt = new Date();
-                logger.log(`Tunnel Watchdog: Autonomous self-healing triggered for remote ports ${remotePort}-${remotePort + 2}`, false);
-                const result = await Provisioner.reclaimPortRange(remotePort, 3);
+                logger.log(`Tunnel Watchdog: Autonomous self-healing triggered for remote ports ${remotePort}-${remotePort + 3}`, false);
+                const result = await Provisioner.reclaimPortRange(remotePort, 4);
                 if (result.success && result.pidsKilled.length > 0) {
                     logger.log(`Tunnel Watchdog: Terminated ${result.pidsKilled.length} zombie process(es): ${result.pidsKilled.join(', ')}`, false);
                 }

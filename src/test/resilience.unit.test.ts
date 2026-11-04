@@ -155,7 +155,13 @@ suite('Resilience & Stability Unit Tests', () => {
         assert.strictEqual(receivedEcho, true);
         assert.strictEqual(responseData, 'PONG_WORMHOLE');
 
-        // 4. Cleanup relay
+        // 4. Test yieldPort
+        await relay.startRelay(listenPort, targetPort);
+        assert.strictEqual(relay.isRelaying(), true);
+        await relay.yieldPort(50);
+        assert.strictEqual(relay.isRelaying(), false);
+
+        // 5. Cleanup relay
         await relay.stopRelay();
         assert.strictEqual(relay.isRelaying(), false);
         await new Promise<void>((res) => targetServer.close(() => res()));

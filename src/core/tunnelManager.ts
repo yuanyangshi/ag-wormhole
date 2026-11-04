@@ -341,6 +341,18 @@ export class TunnelManager {
         };
     }
 
+    private static async terminateKeeperProcess(pid: number): Promise<void> {
+        try {
+            if (process.platform === 'win32') {
+                await execAsync(`taskkill /F /PID ${pid} 2>nul || exit 0`, { windowsHide: true }).catch(() => {});
+            } else {
+                process.kill(pid);
+            }
+        } catch {
+            // Ignore termination errors
+        }
+    }
+
     /**
      * Maintain detached background SSH reverse tunnel keepers for active remote hosts.
      * Prevents tunnel starvation when multiple Remote-SSH windows are open and the primary window closes
@@ -362,11 +374,7 @@ export class TunnelManager {
             if (!enabled) {
                 for (const pids of keeperPidsByHost.values()) {
                     for (const pid of pids) {
-                        try {
-                            process.kill(pid);
-                        } catch {
-                            // Ignore kill error
-                        }
+                        await TunnelManager.terminateKeeperProcess(pid);
                     }
                 }
                 return;
@@ -376,12 +384,8 @@ export class TunnelManager {
             for (const [host, pids] of keeperPidsByHost.entries()) {
                 if (!interactiveHosts.includes(host)) {
                     for (const pid of pids) {
-                        try {
-                            process.kill(pid);
-                            logger.log(`Terminated idle background tunnel keeper (PID ${pid}) for disconnected host '${host}'`, true);
-                        } catch {
-                            // Ignore kill error
-                        }
+                        await TunnelManager.terminateKeeperProcess(pid);
+                        logger.log(`Terminated idle background tunnel keeper (PID ${pid}) for disconnected host '${host}'`, true);
                     }
                 }
             }
@@ -402,6 +406,12 @@ export class TunnelManager {
                 }
 
                 try {
+                    // Secondary quick check before spawning to guard against multi-window concurrency
+                    const freshSessions = await TunnelManager.discoverActiveSshSessions();
+                    if ((freshSessions.keeperPidsByHost.get(host) || []).length > 0) {
+                        continue;
+                    }
+
                     const args = [
                         '-N',
                         '-T',
