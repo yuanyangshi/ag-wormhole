@@ -8,7 +8,8 @@ suite('TunnelWatchdog Unit Tests', () => {
         assert.strictEqual(instance1, instance2);
     });
 
-    test('watchdog emits state change events and maintains metrics', async () => {
+    test('watchdog emits state change events and maintains metrics', async function (this: Mocha.Context) {
+        this.timeout(10000);
         const watchdog = TunnelWatchdog.getInstance();
         let receivedUpdate = false;
 

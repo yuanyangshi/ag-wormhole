@@ -120,6 +120,18 @@ info_log "Discovered Workspace: $SERVER_DIR"
 # Helper Functions
 # ============================================================================
 
+purge_stale_cache() {
+    info_log "Purging stale wormhole caches and temporary files..."
+    rm -rf /tmp/ag_wormhole_* /tmp/*wormhole*.sh /tmp/wormhole_* 2>/dev/null || true
+    for d in "${POSSIBLE_SERVER_DIRS[@]}"; do
+        if [ -d "$d" ]; then
+            find "$d" -maxdepth 3 -name "*.tmp.*" -type f -delete 2>/dev/null || true
+            find "$d" -maxdepth 2 -name ".wormhole-state.json.tmp.*" -type f -delete 2>/dev/null || true
+        fi
+    done
+    info_log "Stale caches purged successfully."
+}
+
 export_proxy_env_helper() {
     local env_dir="$HOME/.ag-wormhole"
     mkdir -p "$env_dir"
@@ -195,6 +207,7 @@ check_needs_update() {
 # ============================================================================
 # Discover Target Language Servers
 # ============================================================================
+purge_stale_cache
 info_log "Scanning for language server binaries..."
 TARGETS=$(find "$SERVER_DIR/bin" -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$" || true)
 

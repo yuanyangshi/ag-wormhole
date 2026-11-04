@@ -18,7 +18,8 @@ import {
     DEFAULT_PROXY_TYPE,
     CMD_SETUP,
     CMD_ROLLBACK,
-    CMD_SHOW_OUTPUT
+    CMD_SHOW_OUTPUT,
+    CMD_PURGE_CACHE
 } from '../shared/constants';
 import { logger } from '../shared/logger';
 
@@ -84,6 +85,9 @@ export class StatusPanel {
                         break;
                     case 'showLogs':
                         await vscode.commands.executeCommand(CMD_SHOW_OUTPUT);
+                        break;
+                    case 'purgeCache':
+                        await vscode.commands.executeCommand(CMD_PURGE_CACHE);
                         break;
                 }
             },
@@ -402,6 +406,7 @@ export class StatusPanel {
         <div class="btn-group" style="margin: 0;">
             <button class="btn btn-secondary" onclick="sendMessage('refresh')">Refresh</button>
             <button class="btn btn-secondary" onclick="sendMessage('runDiagnostics')">Run Diagnostics</button>
+            <button class="btn btn-secondary" onclick="sendMessage('purgeCache')" title="Purge residual temporary caches and re-synchronize">Purge Cache</button>
             <button class="btn btn-secondary" onclick="sendMessage('showLogs')">View Logs</button>
         </div>
     </div>

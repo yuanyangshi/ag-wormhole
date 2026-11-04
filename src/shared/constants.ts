@@ -19,6 +19,7 @@ export const CMD_DIAGNOSE = 'ag-wormhole.diagnose';
 export const CMD_SHOW_TRAFFIC = 'ag-wormhole.showTrafficPanel';
 export const CMD_RECLAIM_PORT = 'ag-wormhole.reclaimPort';
 export const CMD_OPTIMIZE_SSH = 'ag-wormhole.optimizeSSH';
+export const CMD_PURGE_CACHE = 'ag-wormhole.purgeCache';
 
 // Configuration Section & Keys
 export const CONFIG_SECTION = 'ag-wormhole';

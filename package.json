@@ -76,6 +76,10 @@
       {
         "command": "ag-wormhole.optimizeSSH",
         "title": "AG-Wormhole: Optimize SSH Keepalive & Connection Multiplexing"
+      },
+      {
+        "command": "ag-wormhole.purgeCache",
+        "title": "AG-Wormhole: Purge Cache & Clean Reinstall"
       }
     ],
     "configuration": {

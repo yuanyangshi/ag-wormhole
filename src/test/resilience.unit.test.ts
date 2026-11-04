@@ -31,6 +31,16 @@ suite('Resilience & Stability Unit Tests', () => {
         assert.strictEqual(protectedSet.has(process.ppid), true);
     });
 
+    test('Provisioner.purgeStaleCaches runs safely without throwing', async () => {
+        const res = await Provisioner.purgeStaleCaches();
+        assert.ok(typeof res.success === 'boolean');
+        assert.ok(typeof res.message === 'string');
+    });
+
+    test('TunnelManager.purgeLocalCache runs safely without throwing', async () => {
+        await TunnelManager.purgeLocalCache();
+    });
+
     test('TunnelManager.checkProxyL7 correctly validates mock HTTP proxy', async () => {
         // Spin up temporary mock HTTP proxy listener
         const server = net.createServer((socket) => {

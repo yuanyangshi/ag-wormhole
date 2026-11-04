@@ -462,4 +462,32 @@ export class TunnelManager {
             TunnelManager.isSyncingKeepers = false;
         }
     }
+
+    /**
+     * Purge local temporary SSH config artifacts and recycle stale background keeper processes
+     */
+    public static async purgeLocalCache(): Promise<void> {
+        try {
+            const sshDir = SSHConfigManager.getSSHDir();
+            const fs = require('fs/promises');
+            const path = require('path');
+            const tmpFile = path.join(sshDir, 'config.wormhole.tmp');
+            try {
+                await fs.unlink(tmpFile);
+            } catch {
+                // Ignore missing file
+            }
+
+            // Recycle existing keeper processes
+            const { keeperPidsByHost } = await TunnelManager.discoverActiveSshSessions();
+            for (const pids of keeperPidsByHost.values()) {
+                for (const pid of pids) {
+                    await TunnelManager.terminateKeeperProcess(pid);
+                }
+            }
+            logger.log('Purged local temporary SSH artifacts and recycled background keepers.', true);
+        } catch (err) {
+            logger.log(`Notice during local cache purge: ${err}`, true);
+        }
+    }
 }

@@ -514,5 +514,41 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             return null;
         }
     }
+
+    /**
+     * Purge residual caches, temporary wrapper artifacts, and orphaned states across remote workspaces
+     */
+    public static async purgeStaleCaches(): Promise<{ success: boolean; message: string }> {
+        try {
+            const homeDir = os.homedir();
+            const serverDirs = [
+                path.join(homeDir, '.ag-wormhole'),
+                path.join(homeDir, '.antigravity-ide-server'),
+                path.join(homeDir, '.antigravity-server')
+            ];
+
+            // 1. Remove temporary setup and state artifacts
+            await execAsync('rm -rf /tmp/ag_wormhole_* /tmp/*wormhole*.sh /tmp/wormhole_* 2>/dev/null || true');
+
+            // 2. Clean temporary files in server workspaces
+            for (const dir of serverDirs) {
+                try {
+                    await execAsync(`find "${dir}" -maxdepth 3 -name "*.tmp.*" -type f -delete 2>/dev/null || true`);
+                } catch {
+                    // Ignore workspace missing
+                }
+            }
+
+            // 3. Terminate any orphaned mgraftcp processes
+            await execAsync('pkill -f "[m]graftcp-fakedns" 2>/dev/null || true');
+
+            logger.log('Purged stale remote wormhole caches and temporary files.', false);
+            return { success: true, message: 'Remote stale caches and orphaned processes purged.' };
+        } catch (err: unknown) {
+            const e = err as { message?: string };
+            logger.log(`Notice during cache purge: ${e.message}`, false);
+            return { success: false, message: `Cache purge completed with notice: ${e.message}` };
+        }
+    }
 }
 

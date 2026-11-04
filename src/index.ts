@@ -32,7 +32,8 @@ import {
     CMD_DIAGNOSE,
     CMD_SHOW_TRAFFIC,
     CMD_RECLAIM_PORT,
-    CMD_OPTIMIZE_SSH
+    CMD_OPTIMIZE_SSH,
+    CMD_PURGE_CACHE
 } from './shared/constants';
 import { SSHConfigManager } from './core/sshConfigManager';
 import { TunnelManager } from './core/tunnelManager';
@@ -181,8 +182,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             } else if (action === 'Open Status Dashboard') {
                 await vscode.commands.executeCommand(CMD_SHOW_STATUS_PANEL);
             }
+        }),
+
+        vscode.commands.registerCommand(CMD_PURGE_CACHE, async () => {
+            if (isRunningLocally()) {
+                await TunnelManager.purgeLocalCache();
+                await TunnelManager.syncLocalForwarding();
+                vscode.window.showInformationMessage('[AG-Wormhole] Local tunnel cache purged and background keepers recycled.');
+            } else {
+                const res = await Provisioner.purgeStaleCaches();
+                const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+                const host = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
+                const port = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
+                const type = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
+                await Provisioner.runSetupSilently(host, port, type, context.extensionUri.fsPath);
+                vscode.window.showInformationMessage(`[AG-Wormhole] ${res.message} Sandbox re-synchronized.`);
+            }
+            await refreshAllStatus();
         })
     );
+
+    // Lifecycle Hook: detect reinstallation or upgrade, and automatically purge stale caches
+    const LAST_VERSION_KEY = 'ag-wormhole.lastInstalledVersion';
+    const currentVersion = context.extension?.packageJSON?.version || '1.0.0';
+    const lastVersion = context.globalState.get<string>(LAST_VERSION_KEY);
+    if (lastVersion !== currentVersion) {
+        logger.log(`Installation/Reinstallation detected (${lastVersion || 'fresh'} -> ${currentVersion}). Auto-purging residual caches...`, isRunningLocally());
+        try {
+            if (isRunningLocally()) {
+                await TunnelManager.purgeLocalCache();
+            } else {
+                await Provisioner.purgeStaleCaches();
+            }
+        } catch {
+            // Ignore non-blocking purge failure
+        }
+        await context.globalState.update(LAST_VERSION_KEY, currentVersion);
+    }
 
     if (isRunningLocally()) {
         await activateLocal(context);
