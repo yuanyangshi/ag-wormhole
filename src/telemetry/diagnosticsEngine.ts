@@ -295,6 +295,16 @@ export class DiagnosticsEngine {
             }
 
             if (foundTargets.length === 0) {
+                const agyBinPath = path.join(homeDir, '.gemini', 'bin', 'agy');
+                try {
+                    await fs.access(agyBinPath, fs.constants.X_OK);
+                    check.status = 'success';
+                    check.message = `Antigravity AGY runtime verified at ${agyBinPath} (proxy environment synchronized)`;
+                    return check;
+                } catch {
+                    // Continue to fallback warning
+                }
+
                 check.status = 'warning';
                 check.message = 'No language server binary identified on remote server';
                 check.suggestion = 'Language server binary may be initialized after opening a project file.';

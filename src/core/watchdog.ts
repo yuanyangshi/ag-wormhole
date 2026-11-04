@@ -178,7 +178,7 @@ export class TunnelWatchdog {
                 }
 
                 const primaryPids = isReachable ? await Provisioner.getListeningPids(remotePort) : [];
-                const fallbackPorts = [remotePort + 1, remotePort + 2];
+                const fallbackPorts = [remotePort + 1, remotePort + 2, remotePort + 3];
 
                 for (const fp of fallbackPorts) {
                     if (fp === probePort && !isReachable) {
@@ -232,6 +232,14 @@ export class TunnelWatchdog {
                 this.metrics.consecutiveFailures = 0;
                 this.metrics.state = 'HEALTHY';
                 this.metrics.reconnectPromptShown = false;
+
+                if (isRunningLocally()) {
+                    try {
+                        await TunnelManager.ensureBackgroundTunnelKeepers(localPort, remotePort, true);
+                    } catch {
+                        // Ignore keeper check error in standalone test context
+                    }
+                }
 
                 if (wasDisconnected && isRunningLocally()) {
                     // Auto-sync when local gateway is brought back online

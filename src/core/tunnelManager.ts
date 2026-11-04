@@ -4,8 +4,11 @@
  */
 
 import * as net from 'net';
+import { exec, spawn } from 'child_process';
+import { promisify } from 'util';
 import { SSHConfigManager } from './sshConfigManager';
 import { logger } from '../shared/logger';
+import { isRunningLocally } from '../shared/environment';
 import {
     CONFIG_SECTION,
     CFG_ENABLE_LOCAL_FORWARDING,
@@ -14,7 +17,10 @@ import {
     DEFAULT_PROXY_PORT
 } from '../shared/constants';
 
+const execAsync = promisify(exec);
+
 export class TunnelManager {
+    private static isSyncingKeepers = false;
     /**
      * Test TCP connectivity to specified endpoint
      */
@@ -218,9 +224,232 @@ export class TunnelManager {
                 } catch {
                     // Non-VS Code environment
                 }
+            } else if (isRunningLocally()) {
+                await TunnelManager.ensureBackgroundTunnelKeepers(effectiveLocalPort, remotePort, true);
             }
+        } else if (isRunningLocally()) {
+            await TunnelManager.ensureBackgroundTunnelKeepers(effectiveLocalPort, remotePort, false);
         }
 
         return { enabled, localPort: effectiveLocalPort, remotePort };
+    }
+
+    /**
+     * Parse an SSH client command line to extract the destination host and identify keeper processes
+     */
+    public static parseSshCommandDestination(cmdLine: string): { host: string; isKeeper: boolean } | null {
+        if (!cmdLine || !cmdLine.trim()) {
+            return null;
+        }
+
+        const tokens: string[] = [];
+        const regex = /"([^"]*)"|'([^']*)'|(\S+)/g;
+        let match: RegExpExecArray | null;
+        while ((match = regex.exec(cmdLine)) !== null) {
+            tokens.push(match[1] ?? match[2] ?? match[3]);
+        }
+
+        if (tokens.length < 2) {
+            return null;
+        }
+
+        const exe = tokens[0].toLowerCase().replace(/\\/g, '/');
+        if (exe !== 'ssh' && exe !== 'ssh.exe' && !exe.endsWith('/ssh') && !exe.endsWith('/ssh.exe')) {
+            return null;
+        }
+
+        const isKeeper =
+            cmdLine.includes('AG_WORMHOLE_KEEPER') ||
+            (cmdLine.includes('ClearAllForwardings=yes') && tokens.includes('-N'));
+
+        const argFlags = new Set([
+            '-B', '-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J',
+            '-L', '-l', '-m', '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w'
+        ]);
+
+        for (let i = 1; i < tokens.length; i++) {
+            const token = tokens[i];
+            if (argFlags.has(token)) {
+                i++; // Skip option argument
+                continue;
+            }
+            if (token.startsWith('-')) {
+                continue;
+            }
+            if (/^[a-zA-Z0-9._@-]+$/.test(token) && token !== 'localhost' && token !== '127.0.0.1') {
+                return { host: token, isKeeper };
+            }
+            break;
+        }
+
+        return null;
+    }
+
+    /**
+     * Discover active interactive SSH sessions and background keeper processes on the local machine
+     */
+    public static async discoverActiveSshSessions(): Promise<{
+        interactiveHosts: string[];
+        keeperPidsByHost: Map<string, number[]>;
+    }> {
+        const interactiveHosts = new Set<string>();
+        const keeperPidsByHost = new Map<string, number[]>();
+
+        try {
+            let stdout = '';
+            if (process.platform === 'win32') {
+                const psCmd = 'powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\"Name = \'ssh.exe\'\\" | ForEach-Object { \\"$($_.ProcessId)`t$($_.CommandLine)\\" }"';
+                const res = await execAsync(psCmd, { timeout: 4000, windowsHide: true });
+                stdout = res.stdout;
+            } else {
+                const res = await execAsync('ps -eo pid=,args= | grep -E "[s]sh " || true', { timeout: 3000 });
+                stdout = res.stdout;
+            }
+
+            const lines = stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            for (const line of lines) {
+                const firstSpaceIdx = line.search(/\s/);
+                if (firstSpaceIdx === -1) {
+                    continue;
+                }
+                const pid = parseInt(line.slice(0, firstSpaceIdx).trim(), 10);
+                const cmdLine = line.slice(firstSpaceIdx + 1).trim();
+                if (isNaN(pid) || pid <= 0) {
+                    continue;
+                }
+
+                const parsed = TunnelManager.parseSshCommandDestination(cmdLine);
+                if (!parsed) {
+                    continue;
+                }
+
+                if (parsed.isKeeper) {
+                    const list = keeperPidsByHost.get(parsed.host) || [];
+                    list.push(pid);
+                    keeperPidsByHost.set(parsed.host, list);
+                } else {
+                    interactiveHosts.add(parsed.host);
+                }
+            }
+        } catch {
+            // Ignore process listing errors
+        }
+
+        return {
+            interactiveHosts: Array.from(interactiveHosts),
+            keeperPidsByHost
+        };
+    }
+
+    /**
+     * Maintain detached background SSH reverse tunnel keepers for active remote hosts.
+     * Prevents tunnel starvation when multiple Remote-SSH windows are open and the primary window closes
+     * or switches to a local workspace.
+     */
+    public static async ensureBackgroundTunnelKeepers(
+        localPort: number,
+        remotePort: number,
+        enabled: boolean = true
+    ): Promise<void> {
+        if (TunnelManager.isSyncingKeepers) {
+            return;
+        }
+        TunnelManager.isSyncingKeepers = true;
+
+        try {
+            const { interactiveHosts, keeperPidsByHost } = await TunnelManager.discoverActiveSshSessions();
+
+            if (!enabled) {
+                for (const pids of keeperPidsByHost.values()) {
+                    for (const pid of pids) {
+                        try {
+                            process.kill(pid);
+                        } catch {
+                            // Ignore kill error
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Terminate keeper processes for hosts that no longer have any active interactive Remote-SSH session
+            for (const [host, pids] of keeperPidsByHost.entries()) {
+                if (!interactiveHosts.includes(host)) {
+                    for (const pid of pids) {
+                        try {
+                            process.kill(pid);
+                            logger.log(`Terminated idle background tunnel keeper (PID ${pid}) for disconnected host '${host}'`, true);
+                        } catch {
+                            // Ignore kill error
+                        }
+                    }
+                }
+            }
+
+            if (interactiveHosts.length === 0) {
+                return;
+            }
+
+            const localReachable = await TunnelManager.checkPortAvailable('127.0.0.1', localPort, 1000);
+            if (!localReachable) {
+                return;
+            }
+
+            for (const host of interactiveHosts) {
+                const existingKeepers = keeperPidsByHost.get(host) || [];
+                if (existingKeepers.length > 0) {
+                    continue;
+                }
+
+                try {
+                    const args = [
+                        '-N',
+                        '-T',
+                        '-o', 'BatchMode=yes',
+                        '-o', 'ExitOnForwardFailure=no',
+                        '-o', 'ServerAliveInterval=15',
+                        '-o', 'ServerAliveCountMax=3',
+                        '-o', 'TCPKeepAlive=yes',
+                        '-o', 'ConnectTimeout=10',
+                        '-o', 'ConnectionAttempts=2',
+                        '-o', 'StreamLocalBindUnlink=yes',
+                        '-o', 'SendEnv=AG_WORMHOLE_KEEPER',
+                        '-R', `${remotePort}:127.0.0.1:${localPort}`,
+                        '-R', `${remotePort + 3}:127.0.0.1:${localPort}`,
+                        host
+                    ];
+
+                    if (process.platform === 'win32') {
+                        const cmdStr = `ssh.exe ${args.join(' ')}`;
+                        const wmiCmd = [
+                            'powershell -NoProfile -NonInteractive -Command "',
+                            '$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }; ',
+                            `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${cmdStr}'; ProcessStartupInformation = $si } | Out-Null`,
+                            '"'
+                        ].join('');
+                        await execAsync(wmiCmd, { timeout: 4000, windowsHide: true });
+                    } else {
+                        const child = spawn('ssh', args, {
+                            detached: true,
+                            stdio: 'ignore',
+                            windowsHide: true
+                        });
+                        child.on('error', () => {
+                            // Ignore spawn errors if ssh binary is missing
+                        });
+                        child.unref();
+                    }
+
+                    logger.log(
+                        `Spawned autonomous HA tunnel keeper for remote host '${host}' (ports ${remotePort}, ${remotePort + 3} -> 127.0.0.1:${localPort})`,
+                        true
+                    );
+                } catch (err) {
+                    logger.log(`Failed to spawn tunnel keeper for host '${host}': ${err}`, true);
+                }
+            }
+        } finally {
+            TunnelManager.isSyncingKeepers = false;
+        }
     }
 }

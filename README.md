@@ -21,8 +21,10 @@ To prevent frequent SSH tunnel disconnects, dead socket locks, and silent forwar
 
 ### 2. Autonomous Watchdog & Self-Healing Engine (`TunnelWatchdog`)
 - **Low-Overhead Probes**: Probes tunnel endpoints every 10 seconds (configurable via `ag-wormhole.watchdogInterval`) using a 3-state health model (`HEALTHY`, `DEGRADED`, `DISCONNECTED`) with throttled L7 validation to prevent SSH `forwarded-tcpip` channel storms.
+- **Multi-Window Local + Remote Coexistence (Autonomous Background Tunnel Keeper)**: Automatically detects active Remote-SSH sessions on the local host and maintains a dedicated, job-independent background SSH reverse tunnel keeper (`remotePort` and standby `remotePort + 3`). Closing the primary Remote-SSH window or opening a local Antigravity workspace never starves remaining remote windows.
 - **Local Gateway Auto-Reconnection**: Automatically detects when local proxy software (Clash, V2Ray, Mihomo) goes online, immediately triggering SSH reverse tunnel synchronization.
 - **Session-Safe Zombie Port Auto-Reclaim**: When connection loss is detected and `ag-wormhole.autoReclaimPort` is enabled, the watchdog inspects strictly `LISTEN`-state sockets, protects the active `sshd` ancestor tree and live child sessions, and selectively terminates only orphaned zombie processes locking the remote proxy port.
+- **Antigravity AGY & Legacy Language Server Dual Compatibility**: Supports both legacy `language_server_linux_*` syscall redirection (`mgraftcp-fakedns`) and modern Antigravity IDE 2.6+ `agy` (`~/.gemini/bin/agy`) hub runtime environments.
 
 ### 3. Linux Kernel TCP KeepAlive Diagnostics
 - Audits remote Linux system `/proc/sys/net/ipv4/tcp_keepalive_time` to prevent the default 7200-second (2-hour) TCP dead socket persistence during client network drops.

@@ -87,6 +87,7 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
             : await TunnelManager.checkPortAvailable(remoteHost, remotePort);
         const lsProcess = await Provisioner.getLanguageServerProcess();
         const isMgraftcpRunning = await Provisioner.isMgraftcpRunning();
+        const isAgyConfigured = await Provisioner.isAgyRuntimeConfigured();
 
         currentStatus = {
             runningLocation: 'remote',
@@ -96,7 +97,7 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
             remoteProxyHost: remoteHost,
             localProxyReachable: false,
             remoteProxyReachable: remoteReachable || watchdogMetrics.state === 'HEALTHY',
-            languageServerConfigured: lsProcess?.isUsingProxy || isMgraftcpRunning,
+            languageServerConfigured: Boolean(lsProcess?.isUsingProxy || isMgraftcpRunning || isAgyConfigured),
             activeTunnelPort: watchdogMetrics.activeTunnelPort || remotePort,
             isRelaying: watchdogMetrics.isRelaying,
             lastUpdated: new Date()
@@ -323,29 +324,42 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
         })
     );
 
-    // Auto-inject terminal proxy environment variables if enabled
+    // Auto-inject terminal and extension-host proxy environment variables if enabled
     const autoInjectTerminal = config.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
-    if (autoInjectTerminal && context.environmentVariableCollection) {
+    if (autoInjectTerminal) {
         const proxyUrl = `http://${remoteHost}:${remotePort}`;
         const allProxyUrl = `${proxyType}://${remoteHost}:${remotePort}`;
-        context.environmentVariableCollection.replace('http_proxy', proxyUrl);
-        context.environmentVariableCollection.replace('https_proxy', proxyUrl);
-        context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
-        context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
-        context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
-        context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
-        logger.log(`Injected proxy environment variables into remote terminals: ${proxyUrl}`, false);
+        process.env.http_proxy = proxyUrl;
+        process.env.https_proxy = proxyUrl;
+        process.env.HTTP_PROXY = proxyUrl;
+        process.env.HTTPS_PROXY = proxyUrl;
+        process.env.all_proxy = allProxyUrl;
+        process.env.ALL_PROXY = allProxyUrl;
+        if (!process.env.no_proxy && !process.env.NO_PROXY) {
+            process.env.no_proxy = 'localhost,127.0.0.1,::1';
+            process.env.NO_PROXY = 'localhost,127.0.0.1,::1';
+        }
+        if (context.environmentVariableCollection) {
+            context.environmentVariableCollection.replace('http_proxy', proxyUrl);
+            context.environmentVariableCollection.replace('https_proxy', proxyUrl);
+            context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
+            context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
+            context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
+            context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
+            logger.log(`Injected proxy environment variables into remote terminals: ${proxyUrl}`, false);
+        }
     }
 
     // Auto-setup silently
     await Provisioner.runSetupSilently(remoteHost, remotePort, proxyType, extensionPath);
     trafficCollector.start();
 
-    // Check startup status
+    // Check startup status (after watchdog probe has had a chance to bridge fallback ports if needed)
     const showStartupNotification = config.get<boolean>(CFG_SHOW_STATUS_ON_STARTUP, true);
     if (showStartupNotification) {
         setTimeout(async () => {
-            const reachable = await TunnelManager.checkPortAvailable(remoteHost, remotePort);
+            const metrics = await TunnelWatchdog.getInstance().probe();
+            const reachable = metrics.state === 'HEALTHY' || await TunnelManager.checkPortAvailable(remoteHost, remotePort);
             if (reachable) {
                 vscode.window.showInformationMessage(`[AG-Wormhole] Data plane active at ${remoteHost}:${remotePort} (${proxyType.toUpperCase()})`);
             } else {

@@ -35,7 +35,7 @@ export class Provisioner {
      */
     public static async isMgraftcpRunning(): Promise<boolean> {
         try {
-            const { stdout } = await execAsync('pgrep -f mgraftcp');
+            const { stdout } = await execAsync('pgrep -f "[m]graftcp-fakedns"');
             return stdout.trim().length > 0;
         } catch {
             return false;
@@ -43,7 +43,41 @@ export class Provisioner {
     }
 
     /**
-     * Inspect active Language Server process state and wrapper status
+     * Check whether modern Antigravity AGY runtime is installed and synchronized with AG-Wormhole
+     */
+    public static async isAgyRuntimeConfigured(): Promise<boolean> {
+        const homeDir = os.homedir();
+        const serverDirs = [
+            path.join(homeDir, '.ag-wormhole'),
+            path.join(homeDir, '.antigravity-ide-server'),
+            path.join(homeDir, '.antigravity-server')
+        ];
+
+        for (const dir of serverDirs) {
+            const stateFile = path.join(dir, '.wormhole-state.json');
+            try {
+                await fs.access(stateFile);
+                return true;
+            } catch {
+                // Continue checking
+            }
+        }
+
+        const agyBinary = path.join(homeDir, '.gemini', 'bin', 'agy');
+        try {
+            await fs.access(agyBinary);
+            if (process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.https_proxy) {
+                return true;
+            }
+        } catch {
+            // AGY binary not found
+        }
+
+        return false;
+    }
+
+    /**
+     * Inspect active Language Server / AGY runtime process state and proxy status
      */
     public static async getLanguageServerProcess(): Promise<LanguageServerProcessInfo | null> {
         try {
@@ -73,8 +107,45 @@ export class Provisioner {
                 }
             }
         } catch {
-            // Process not found or ps execution failed
+            // Legacy process not found, check modern AGY runtime next
         }
+
+        // Modern Antigravity 2.6+ AGY Hub Runtime (~/.gemini/bin/agy --hub)
+        try {
+            const { stdout } = await execAsync('ps auxww | grep -E "/\\.gemini/bin/agy|agy --hub" | grep -v grep');
+            const lines = stdout.trim().split('\n').filter(l => l.length > 0);
+            for (const line of lines) {
+                const parts = line.split(/\s+/);
+                if (parts.length >= 2) {
+                    const pid = parseInt(parts[1], 10);
+                    if (!isNaN(pid) && pid > 0) {
+                        let hasProxyEnv = Boolean(
+                            process.env.HTTP_PROXY ||
+                            process.env.HTTPS_PROXY ||
+                            process.env.http_proxy ||
+                            process.env.https_proxy
+                        );
+                        try {
+                            const envRaw = await fs.readFile(`/proc/${pid}/environ`, 'utf-8');
+                            if (/HTTP_PROXY=|HTTPS_PROXY=|http_proxy=|https_proxy=|ALL_PROXY=|all_proxy=/i.test(envRaw)) {
+                                hasProxyEnv = true;
+                            }
+                        } catch {
+                            // Ignore /proc read restriction
+                        }
+                        const stateConfigured = await Provisioner.isAgyRuntimeConfigured();
+                        return {
+                            pid,
+                            isPersistent: false,
+                            isUsingProxy: hasProxyEnv || stateConfigured
+                        };
+                    }
+                }
+            }
+        } catch {
+            // AGY process not running
+        }
+
         return null;
     }
 
@@ -272,6 +343,15 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 break;
             } catch {
                 break;
+            }
+        }
+
+        // 2. Protect active dedicated background keeper listener on port+3
+        const keeperPort = port + 3;
+        if (keeperPort > 0 && keeperPort <= 65535) {
+            const keeperPids = await Provisioner.getListeningPids(keeperPort);
+            for (const pid of keeperPids) {
+                protectedPids.add(pid);
             }
         }
 

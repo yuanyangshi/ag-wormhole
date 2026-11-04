@@ -170,9 +170,40 @@ check_needs_update() {
 # Discover Target Language Servers
 # ============================================================================
 info_log "Scanning for language server binaries..."
-TARGETS=$(find "$SERVER_DIR/bin" -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$")
+TARGETS=$(find "$SERVER_DIR/bin" -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$" || true)
 
 if [ -z "$TARGETS" ]; then
+    AGY_EXT_DIRS=$(find "$SERVER_DIR/bin" -maxdepth 3 -path "*/extensions/agy" -type d 2>/dev/null || true)
+    if [ -n "$AGY_EXT_DIRS" ] || [ -f "$HOME/.gemini/bin/agy" ]; then
+        info_log "Detected modern Antigravity AGY Runtime environment."
+        STATE_FILE="$SERVER_DIR/.wormhole-state.json"
+        STATE_TMP="${STATE_FILE}.tmp.$$"
+        cat > "$STATE_TMP" << STATE_EOF
+{
+  "version": "$EXTENSION_VERSION",
+  "proxyAddr": "$PROXY_ADDR",
+  "proxyType": "$PROXY_TYPE",
+  "runtime": "agy",
+  "updatedAt": "$(date -Iseconds)"
+}
+STATE_EOF
+        mv -f "$STATE_TMP" "$STATE_FILE"
+        info_log "Synchronized AGY runtime proxy state: $STATE_FILE"
+        echo ""
+        echo "================================================================="
+        echo " AG-Wormhole: Provisioning Summary"
+        echo "================================================================="
+        echo "  Version: $EXTENSION_VERSION"
+        echo "  Runtime: Antigravity AGY ($HOME/.gemini/bin/agy)"
+        echo "  Tunnel Endpoint: $PROXY_ADDR ($PROXY_TYPE)"
+        echo "-----------------------------------------------------------------"
+        echo "  Configured: 1 AGY runtime environment synchronized"
+        echo "================================================================="
+        echo ""
+        echo "Setup complete: proxy=$PROXY_ADDR"
+        exit 0
+    fi
+
     error_log "No eligible language server binaries identified."
     exit 1
 fi

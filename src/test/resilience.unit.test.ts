@@ -160,5 +160,18 @@ suite('Resilience & Stability Unit Tests', () => {
         assert.strictEqual(relay.isRelaying(), false);
         await new Promise<void>((res) => targetServer.close(() => res()));
     });
+
+    test('TunnelManager.parseSshCommandDestination accurately extracts interactive and keeper SSH targets', () => {
+        const remoteSshCmd = 'ssh -v -T -D 54102 remote-host "bash -s"';
+        const parsed1 = TunnelManager.parseSshCommandDestination(remoteSshCmd);
+        assert.deepStrictEqual(parsed1, { host: 'remote-host', isKeeper: false });
+
+        const winPathCmd = '"C:\\Windows\\System32\\OpenSSH\\ssh.exe" -N -T -o BatchMode=yes -o ClearAllForwardings=yes -o SendEnv=AG_WORMHOLE_KEEPER -R 7890:127.0.0.1:7890 -R 7893:127.0.0.1:7890 user@remote-gpu.internal';
+        const parsed2 = TunnelManager.parseSshCommandDestination(winPathCmd);
+        assert.deepStrictEqual(parsed2, { host: 'user@remote-gpu.internal', isKeeper: true });
+
+        const invalidCmd = 'node --inspect=127.0.0.1:9229 extensionHostProcess.js';
+        assert.strictEqual(TunnelManager.parseSshCommandDestination(invalidCmd), null);
+    });
 });
 
