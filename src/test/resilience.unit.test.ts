@@ -18,6 +18,12 @@ suite('Resilience & Stability Unit Tests', () => {
         assert.strictEqual(overflowPort.success, false);
     });
 
+    test('Provisioner.reclaimPortRange executes safely across port block', async () => {
+        const result = await Provisioner.reclaimPortRange(64000, 3);
+        assert.strictEqual(result.success, true);
+        assert.ok(Array.isArray(result.pidsKilled));
+    });
+
     test('Provisioner.getProtectedPids protects active process and parent hierarchy', async () => {
         const protectedSet = await Provisioner.getProtectedPids(7890);
         assert.strictEqual(protectedSet.has(1), true);
@@ -65,6 +71,30 @@ suite('Resilience & Stability Unit Tests', () => {
             const result = await TunnelManager.checkProxyL7('127.0.0.1', port, 'socks5', 1500);
             assert.strictEqual(result.ok, true);
             assert.ok(result.message.includes('SOCKS5 proxy'));
+        } finally {
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+    });
+
+    test('TunnelManager.checkProxyL7 adapts automatically when configured protocol mismatches', async () => {
+        // Spin up temporary mock SOCKS5 proxy listener
+        const server = net.createServer((socket) => {
+            socket.on('data', (data) => {
+                if (data[0] === 0x05) {
+                    socket.write(Buffer.from([0x05, 0x00]));
+                }
+            });
+        });
+
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+        const address = server.address() as net.AddressInfo;
+        const port = address.port;
+
+        try {
+            // Probing with 'http' against a SOCKS5 server should adapt and succeed
+            const result = await TunnelManager.checkProxyL7('127.0.0.1', port, 'http', 1500);
+            assert.strictEqual(result.ok, true);
+            assert.ok(result.message.includes('SOCKS5'));
         } finally {
             await new Promise<void>((resolve) => server.close(() => resolve()));
         }

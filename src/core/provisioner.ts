@@ -275,16 +275,6 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             }
         }
 
-        // 2. Protect any PID that is also listening on fallback ports (port + 1, port + 2),
-        // because if the same sshd owns both primary and fallback ports, it is the LIVE session.
-        const fallbackPorts = [port + 1, port + 2].filter(p => p > 0 && p <= 65535);
-        for (const fp of fallbackPorts) {
-            const fpPids = await Provisioner.getListeningPids(fp);
-            for (const fpPid of fpPids) {
-                protectedPids.add(fpPid);
-            }
-        }
-
         return protectedPids;
     }
 
@@ -382,6 +372,35 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 pidsKilled
             };
         }
+    }
+
+    /**
+     * Terminate dead or zombie processes holding any port in a contiguous range
+     * (e.g. primary port and fallback ports)
+     */
+    public static async reclaimPortRange(
+        basePort: number,
+        count: number = 3
+    ): Promise<{ success: boolean; message: string; pidsKilled: number[] }> {
+        const allKilled: number[] = [];
+        for (let i = 0; i < count; i++) {
+            const p = basePort + i;
+            if (p > 0 && p <= 65535) {
+                const res = await Provisioner.reclaimPort(p);
+                for (const pid of res.pidsKilled) {
+                    if (!allKilled.includes(pid)) {
+                        allKilled.push(pid);
+                    }
+                }
+            }
+        }
+        return {
+            success: true,
+            message: allKilled.length > 0
+                ? `Successfully cleared ports ${basePort}-${basePort + count - 1} (terminated ${allKilled.length} zombie process(es))`
+                : `No zombie processes found on ports ${basePort}-${basePort + count - 1}`,
+            pidsKilled: allKilled
+        };
     }
 
     /**

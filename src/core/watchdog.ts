@@ -20,7 +20,8 @@ import {
     DEFAULT_PROXY_PORT,
     DEFAULT_PROXY_TYPE,
     DEFAULT_WATCHDOG_INTERVAL_SEC,
-    CMD_RECLAIM_PORT
+    CMD_RECLAIM_PORT,
+    CMD_SHOW_STATUS_PANEL
 } from '../shared/constants';
 
 export type TunnelHealthState = 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED';
@@ -49,8 +50,8 @@ export class TunnelWatchdog {
     private isProbing = false;
     private probeCount = 0;
     private readonly checkIntervalMs = 10000; // 10s non-intrusive probe
-    private readonly failureThreshold = 3; // trigger recovery after 3 consecutive failures
-    private readonly reclaimCooldownMs = 60000; // minimum 60s between automatic port reclaim attempts
+    private readonly failureThreshold = 2; // trigger recovery early after 2 consecutive failures
+    private readonly reclaimCooldownMs = 15000; // 15s between automatic port reclaim attempts
 
     private constructor() {
         this.metrics = {
@@ -170,6 +171,12 @@ export class TunnelWatchdog {
             // If primary remote port is unavailable (or held by a dead zombie sshd from a previous session
             // while a new sshd bound to one of the fallback ports), bridge traffic via IngressRelay.
             if (isRunningRemotely() && (!isReachable || !l7Result?.ok)) {
+                // If currently relaying but the tunnel is broken, reset relay so ports can be re-evaluated
+                if (this.metrics.isRelaying) {
+                    await IngressRelay.getInstance().stopRelay();
+                    this.metrics.isRelaying = false;
+                }
+
                 const primaryPids = isReachable ? await Provisioner.getListeningPids(remotePort) : [];
                 const fallbackPorts = [remotePort + 1, remotePort + 2];
 
@@ -195,6 +202,7 @@ export class TunnelWatchdog {
                         if (fpL7.ok) {
                             logger.log(`Tunnel Watchdog: Detected active fallback SSH tunnel on port ${fp}. Auto-healing primary port ${remotePort}...`, false);
                             await Provisioner.reclaimPort(remotePort);
+                            await new Promise(r => setTimeout(r, 150));
                             const relaySuccess = await IngressRelay.getInstance().startRelay(remotePort, fp);
                             if (relaySuccess) {
                                 l7Result = { ok: true, message: `Relayed via active tunnel port ${fp}` };
@@ -287,35 +295,33 @@ export class TunnelWatchdog {
             const cooldownElapsed = now - lastAttemptMs >= this.reclaimCooldownMs;
 
             // Attempt autonomous zombie port reclamation on remote failure (respecting cooldown)
+            // Automatically clears all ports across the forwarding cluster
             if (autoReclaim && cooldownElapsed) {
                 this.metrics.lastRecoveryAttempt = new Date();
-                logger.log(`Tunnel Watchdog: Autonomous self-healing triggered for remote port ${remotePort}`, false);
-                const result = await Provisioner.reclaimPort(remotePort);
+                logger.log(`Tunnel Watchdog: Autonomous self-healing triggered for remote ports ${remotePort}-${remotePort + 2}`, false);
+                const result = await Provisioner.reclaimPortRange(remotePort, 3);
                 if (result.success && result.pidsKilled.length > 0) {
-                    logger.log(`Tunnel Watchdog: Terminated ${result.pidsKilled.length} zombie process(es)`, false);
+                    logger.log(`Tunnel Watchdog: Terminated ${result.pidsKilled.length} zombie process(es): ${result.pidsKilled.join(', ')}`, false);
                 }
             }
 
-            // Show reconnect notification only after prolonged outage (>= 5 probes, ~50s)
-            // to allow transient SSH auto-reconnect and IngressRelay recovery without disruption.
-            if (this.metrics.consecutiveFailures >= 5 && !this.metrics.reconnectPromptShown) {
+            // Show non-intrusive notification only after prolonged outage (>= 8 probes, ~80s)
+            // Informing user that background self-healing is running, without requiring manual intervention.
+            if (this.metrics.consecutiveFailures >= 8 && !this.metrics.reconnectPromptShown) {
                 this.metrics.reconnectPromptShown = true;
                 try {
                     const vscode = require('vscode');
-                    const action = await vscode.window.showErrorMessage(
-                        '[AG-Wormhole] Remote proxy tunnel lost! SSH reverse forwarding is unreachable.',
-                        'Reclaim Port',
+                    vscode.window.showWarningMessage(
+                        '[AG-Wormhole] Proxy tunnel unreachable (background self-healing is active). If local proxy (Clash/v2ray) is stopped, please restart it.',
                         'Run Diagnostics',
-                        'Reload Window'
-                    );
-
-                    if (action === 'Reclaim Port') {
-                        await vscode.commands.executeCommand(CMD_RECLAIM_PORT);
-                    } else if (action === 'Run Diagnostics') {
-                        await vscode.commands.executeCommand('ag-wormhole.diagnose');
-                    } else if (action === 'Reload Window') {
-                        await vscode.commands.executeCommand('workbench.action.reloadWindow');
-                    }
+                        'Open Dashboard'
+                    ).then((action: string | undefined) => {
+                        if (action === 'Run Diagnostics') {
+                            vscode.commands.executeCommand('ag-wormhole.diagnose');
+                        } else if (action === 'Open Dashboard') {
+                            vscode.commands.executeCommand(CMD_SHOW_STATUS_PANEL);
+                        }
+                    });
                 } catch {
                     // Non-extension environment
                 }

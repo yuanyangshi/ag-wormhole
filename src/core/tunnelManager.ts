@@ -42,13 +42,37 @@ export class TunnelManager {
 
     /**
      * Perform lightweight application-level (L7) health check without external traffic overhead.
-     * Verifies that the proxy process is actively accepting and parsing protocol frames.
+     * Includes dual-protocol adaptive fallback (HTTP <-> SOCKS5) to prevent false alerts.
      */
     public static async checkProxyL7(
         host: string,
         port: number,
         proxyType: string = 'http',
         timeoutMs: number = 3000
+    ): Promise<{ ok: boolean; message: string }> {
+        const primaryResult = await TunnelManager.checkProxyL7Single(host, port, proxyType, timeoutMs);
+        if (primaryResult.ok) {
+            return primaryResult;
+        }
+
+        // Adaptive protocol fallback: if primary protocol failed or misconfigured, try alternate
+        const alternateType = proxyType.toLowerCase() === 'socks5' ? 'http' : 'socks5';
+        const fallbackResult = await TunnelManager.checkProxyL7Single(host, port, alternateType, Math.min(timeoutMs, 1500));
+        if (fallbackResult.ok) {
+            return {
+                ok: true,
+                message: `${fallbackResult.message} (auto-adapted to ${alternateType.toUpperCase()})`
+            };
+        }
+
+        return primaryResult;
+    }
+
+    private static async checkProxyL7Single(
+        host: string,
+        port: number,
+        proxyType: string,
+        timeoutMs: number
     ): Promise<{ ok: boolean; message: string }> {
         return new Promise((resolve) => {
             const socket = new net.Socket();
@@ -118,6 +142,38 @@ export class TunnelManager {
     }
 
     /**
+     * Scan candidate ports to automatically discover active local proxy listeners
+     */
+    public static async discoverLocalProxyPort(
+        preferredPort: number,
+        candidatePorts: number[] = [7890, 7897, 10809, 10808, 2080, 1080]
+    ): Promise<number | null> {
+        // 1. Try preferred port first
+        if (await TunnelManager.checkPortAvailable('127.0.0.1', preferredPort, 800)) {
+            const l7 = await TunnelManager.checkProxyL7('127.0.0.1', preferredPort, 'http', 1000);
+            if (l7.ok) {
+                return preferredPort;
+            }
+        }
+
+        // 2. Scan remaining candidate ports
+        for (const port of candidatePorts) {
+            if (port === preferredPort) {
+                continue;
+            }
+            const isAvail = await TunnelManager.checkPortAvailable('127.0.0.1', port, 500);
+            if (isAvail) {
+                const l7 = await TunnelManager.checkProxyL7('127.0.0.1', port, 'http', 800);
+                if (l7.ok) {
+                    return port;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Synchronize local SSH port forwarding according to VS Code configuration
      */
     public static async syncLocalForwarding(): Promise<{ enabled: boolean; localPort: number; remotePort: number }> {
@@ -135,16 +191,29 @@ export class TunnelManager {
             // Standalone test context
         }
 
-        logger.log(`Syncing local forwarding (enabled=${enabled}, localPort=${localPort}, remotePort=${remotePort})`, true);
-        await SSHConfigManager.updateConfigFile(remotePort, localPort, enabled);
+        let effectiveLocalPort = localPort;
+        if (enabled) {
+            // Autonomous local proxy detection: if configured local port is down, auto-discover active ports
+            const discovered = await TunnelManager.discoverLocalProxyPort(localPort);
+            if (discovered && discovered !== localPort) {
+                logger.log(
+                    `Autonomous Local Proxy Discovery: detected active proxy on 127.0.0.1:${discovered} (configured: ${localPort}). Auto-adapting SSH tunnel target.`,
+                    true
+                );
+                effectiveLocalPort = discovered;
+            }
+        }
+
+        logger.log(`Syncing local forwarding (enabled=${enabled}, localPort=${effectiveLocalPort}, remotePort=${remotePort})`, true);
+        await SSHConfigManager.updateConfigFile(remotePort, effectiveLocalPort, enabled);
 
         if (enabled) {
-            const isLocalReachable = await TunnelManager.checkPortAvailable('127.0.0.1', localPort);
+            const isLocalReachable = await TunnelManager.checkPortAvailable('127.0.0.1', effectiveLocalPort);
             if (!isLocalReachable) {
                 try {
                     const vscode = require('vscode');
                     vscode.window.showWarningMessage(
-                        `[AG-Wormhole] Local proxy listener at 127.0.0.1:${localPort} is unreachable. Please verify your local proxy gateway is started.`
+                        `[AG-Wormhole] Local proxy listener at 127.0.0.1:${effectiveLocalPort} is unreachable. Please verify your local proxy gateway is started.`
                     );
                 } catch {
                     // Non-VS Code environment
@@ -152,6 +221,6 @@ export class TunnelManager {
             }
         }
 
-        return { enabled, localPort, remotePort };
+        return { enabled, localPort: effectiveLocalPort, remotePort };
     }
 }
