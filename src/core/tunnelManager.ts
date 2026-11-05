@@ -412,11 +412,35 @@ export class TunnelManager {
                         continue;
                     }
 
+                    const mainConfig = SSHConfigManager.getMainConfigPath();
+                    const sshDir = SSHConfigManager.getSSHDir();
+                    let configParam: string[] = [];
+                    try {
+                        const fs = require('fs');
+                        const path = require('path');
+                        if (fs.existsSync(mainConfig)) {
+                            // Build a dedicated keeper SSH config without 'Include config.wormhole'
+                            // so the background keeper ONLY binds remotePort+3 (with ExitOnForwardFailure=yes)
+                            // and never steals fallback ports (remotePort+1, remotePort+2) from interactive reconnects.
+                            const rawMain = fs.readFileSync(mainConfig, 'utf-8') as string;
+                            const keeperCfgContent = rawMain
+                                .split(/\r?\n/)
+                                .filter((line: string) => !line.includes('config.wormhole'))
+                                .join('\n');
+                            const keeperCfgPath = path.join(sshDir, 'config.wormhole.keeper');
+                            fs.writeFileSync(keeperCfgPath, keeperCfgContent, 'utf-8');
+                            configParam = ['-F', keeperCfgPath];
+                        }
+                    } catch {
+                        // ignore fs check error
+                    }
+
                     const args = [
+                        ...configParam,
                         '-N',
                         '-T',
                         '-o', 'BatchMode=yes',
-                        '-o', 'ExitOnForwardFailure=no',
+                        '-o', 'ExitOnForwardFailure=yes',
                         '-o', 'ServerAliveInterval=15',
                         '-o', 'ServerAliveCountMax=3',
                         '-o', 'TCPKeepAlive=yes',
@@ -424,13 +448,13 @@ export class TunnelManager {
                         '-o', 'ConnectionAttempts=2',
                         '-o', 'StreamLocalBindUnlink=yes',
                         '-o', 'SendEnv=AG_WORMHOLE_KEEPER',
-                        '-R', `${remotePort}:127.0.0.1:${localPort}`,
                         '-R', `${remotePort + 3}:127.0.0.1:${localPort}`,
                         host
                     ];
 
                     if (process.platform === 'win32') {
-                        const cmdStr = `ssh.exe ${args.join(' ')}`;
+                        const escapedArgs = args.map(a => (a.includes(' ') && !a.startsWith('"')) ? `\\"${a}\\"` : a);
+                        const cmdStr = `ssh.exe ${escapedArgs.join(' ')}`;
                         const wmiCmd = [
                             'powershell -NoProfile -NonInteractive -Command "',
                             '$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }; ',

@@ -367,6 +367,57 @@ chmod +x "$MGRAFTCP_PATH" 2>/dev/null || true
 # Force Go runtime netdns to cgo for LD_PRELOAD intercept compatibility
 export GODEBUG="${GODEBUG:+$GODEBUG,}netdns=cgo"
 
+# Ensure explicit proxy environment variables are present inside the child process
+export http_proxy="http://${PROXY_ADDR}"
+export https_proxy="http://${PROXY_ADDR}"
+export HTTP_PROXY="http://${PROXY_ADDR}"
+export HTTPS_PROXY="http://${PROXY_ADDR}"
+export all_proxy="${PROXY_TYPE}://${PROXY_ADDR}"
+export ALL_PROXY="${PROXY_TYPE}://${PROXY_ADDR}"
+export no_proxy="${no_proxy:-localhost,127.0.0.1,::1}"
+export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,::1}"
+
+# Pre-flight Ingress L7 Readiness Wait & Dynamic Cluster Failover:
+# Verify both TCP connectivity and L7 proxy responsiveness to bypass dead zombie sshd
+# listeners, waiting up to 4.0s on cold start and failing over to PORT+1..PORT+3 if needed.
+WORMHOLE_HOST="${PROXY_ADDR%:*}"
+WORMHOLE_PORT="${PROXY_ADDR##*:}"
+_probe_proxy_l7() {
+    local _h="$1"
+    local _p="$2"
+    if [ "$PROXY_TYPE" = "socks5" ]; then
+        timeout 0.35 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf '\x05\x01\x00' >&3 && IFS= read -r -t 0.25 -n 1 _c <&3" "$_h" "$_p" 2>/dev/null
+        return $?
+    else
+        timeout 0.35 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 && IFS= read -r -t 0.25 _line <&3 && [ -n \"\$_line\" ]" "$_h" "$_p" 2>/dev/null
+        return $?
+    fi
+}
+if command -v timeout >/dev/null 2>&1; then
+    _PORT_READY=0
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+        if _probe_proxy_l7 "${WORMHOLE_HOST}" "${WORMHOLE_PORT}"; then
+            _PORT_READY=1
+            break
+        fi
+        for _OFFSET in 1 2 3; do
+            _CAND_PORT=$((WORMHOLE_PORT + _OFFSET))
+            if _probe_proxy_l7 "${WORMHOLE_HOST}" "${_CAND_PORT}"; then
+                PROXY_ADDR="${WORMHOLE_HOST}:${_CAND_PORT}"
+                export http_proxy="http://${PROXY_ADDR}"
+                export https_proxy="http://${PROXY_ADDR}"
+                export HTTP_PROXY="http://${PROXY_ADDR}"
+                export HTTPS_PROXY="http://${PROXY_ADDR}"
+                export all_proxy="${PROXY_TYPE}://${PROXY_ADDR}"
+                export ALL_PROXY="${PROXY_TYPE}://${PROXY_ADDR}"
+                _PORT_READY=1
+                break 2
+            fi
+        done
+        sleep 0.25
+    done
+fi
+
 if [ "$PROXY_TYPE" = "socks5" ]; then
     exec "$MGRAFTCP_PATH" --socks5 "$PROXY_ADDR" "$SCRIPT_DIR/$SCRIPT_NAME.bak" "$@"
 else

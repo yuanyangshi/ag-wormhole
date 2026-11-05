@@ -261,13 +261,13 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
 
             if (isNewConfig) {
                 const proc = await Provisioner.getLanguageServerProcess();
-                if (proc && proc.isPersistent) {
+                if (proc && (!proc.isUsingProxy || proc.isPersistent)) {
                     await Provisioner.restartLanguageServer();
                 }
                 return true;
             } else if (output.includes('Already configured') || output.includes('already synchronized')) {
                 const proc = await Provisioner.getLanguageServerProcess();
-                if (proc && !proc.isUsingProxy && proc.isPersistent) {
+                if (proc && !proc.isUsingProxy) {
                     await Provisioner.restartLanguageServer();
                 }
                 return true;
@@ -347,16 +347,34 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             }
         }
 
-        // 2. Protect active dedicated background keeper listener on port+3 ONLY if verified alive.
-        // If the keeper port has an orphaned listener without an active uplink, allow it to be reclaimed.
+        // 2. Protect active dedicated background keeper listener on port+3 ONLY if verified alive at L7.
+        // If the keeper port has an orphaned listener that fails L7, allow it to be reclaimed.
         const keeperPort = port + 3;
-        if (keeperPort > 0 && keeperPort <= 65535) {
+        if (keeperPort > 0 && keeperPort <= 65535 && keeperPort !== port) {
             const isKeeperPortAlive = await new Promise<boolean>((resolve) => {
                 const s = new net.Socket();
-                s.setTimeout(800);
-                s.on('connect', () => { s.destroy(); resolve(true); });
-                s.on('timeout', () => { s.destroy(); resolve(false); });
-                s.on('error', () => { s.destroy(); resolve(false); });
+                let done = false;
+                const finish = (ok: boolean) => {
+                    if (done) {
+                        return;
+                    }
+                    done = true;
+                    s.removeAllListeners();
+                    s.destroy();
+                    resolve(ok);
+                };
+                s.setTimeout(500);
+                s.on('connect', () => {
+                    try {
+                        s.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+                    } catch {
+                        finish(false);
+                    }
+                });
+                s.on('data', (chunk) => finish(Boolean(chunk && chunk.length > 0)));
+                s.on('timeout', () => finish(false));
+                s.on('error', () => finish(false));
+                s.on('close', () => finish(false));
                 s.connect(keeperPort, '127.0.0.1');
             });
 
@@ -372,7 +390,26 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
     }
 
     /**
-     * Check whether a candidate PID is a safe-to-reclaim orphaned zombie tunnel process
+     * Read process start time (clock ticks since system boot) from /proc/<pid>/stat
+     */
+    private static async getProcessStartTimeTicks(pid: number): Promise<number | null> {
+        try {
+            const statContent = await fs.readFile(`/proc/${pid}/stat`, 'utf-8');
+            const closeParenIdx = statContent.lastIndexOf(')');
+            if (closeParenIdx === -1) {
+                return null;
+            }
+            const fields = statContent.slice(closeParenIdx + 2).trim().split(/\s+/);
+            // Field 22 in /proc/[pid]/stat is starttime (index 19 after the comm field)
+            const startTicks = parseInt(fields[19], 10);
+            return isNaN(startTicks) ? null : startTicks;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Check whether a candidate PID is a safe-to-reclaim orphaned or superseded zombie tunnel process
      */
     private static async isSafeZombieCandidate(pid: number, protectedPids: Set<number>): Promise<boolean> {
         if (protectedPids.has(pid)) {
@@ -397,14 +434,43 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 return false;
             }
 
-            // If it is an sshd process, verify it has no live child processes (shells/servers).
-            // An orphaned sshd holding a dead RemoteForward port has zero active child processes.
+            // If it is an sshd process:
+            // 1. An sshd with zero child processes is an orphaned tunnel session -> safe to reclaim.
+            // 2. In Remote-SSH ("bash -s"), a dead disconnected sshd may still have an old shell child
+            //    until TCP keepalive expires; if a newer interactive sshd session for the same user
+            //    already exists, this older sshd holding a dead proxy port is a superseded zombie session.
             if (cmdLine.includes('sshd')) {
                 const { stdout: childrenOut } = await execAsync(`pgrep -P ${pid} 2>/dev/null || true`);
-                if (childrenOut.trim().length > 0) {
-                    logger.log(`Skipping active sshd session (PID ${pid}) with live child processes`, false);
-                    return false;
+                if (childrenOut.trim().length === 0) {
+                    return true;
                 }
+
+                const candidateStart = await Provisioner.getProcessStartTimeTicks(pid);
+                if (candidateStart !== null) {
+                    const { stdout: userSshdOut } = await execAsync('pgrep -u $(id -u) sshd 2>/dev/null || true');
+                    const otherPids = userSshdOut
+                        .trim()
+                        .split(/\s+/)
+                        .map((s) => parseInt(s, 10))
+                        .filter((p) => !isNaN(p) && p > 0 && p !== pid);
+
+                    for (const otherPid of otherPids) {
+                        const { stdout: otherChildren } = await execAsync(`pgrep -P ${otherPid} 2>/dev/null || true`);
+                        if (otherChildren.trim().length > 0) {
+                            const otherStart = await Provisioner.getProcessStartTimeTicks(otherPid);
+                            if (otherStart !== null && otherStart > candidateStart) {
+                                logger.log(
+                                    `Identified superseded stale sshd session (PID ${pid}, older than active sshd PID ${otherPid}) for reclamation`,
+                                    false
+                                );
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                logger.log(`Skipping active sshd session (PID ${pid}) with live child processes`, false);
+                return false;
             }
 
             return true;
@@ -438,7 +504,15 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 }
                 try {
                     await execAsync(`kill -15 ${pid} 2>/dev/null || true`);
-                    await new Promise(resolve => setTimeout(resolve, 200));
+                    // Poll rapidly (up to 120ms) for graceful exit before issuing SIGKILL
+                    for (let i = 0; i < 6; i++) {
+                        await new Promise(resolve => setTimeout(resolve, 20));
+                        try {
+                            await fs.access(`/proc/${pid}`);
+                        } catch {
+                            break;
+                        }
+                    }
                     await execAsync(`kill -9 ${pid} 2>/dev/null || true`);
                     pidsKilled.push(pid);
                 } catch {

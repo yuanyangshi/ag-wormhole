@@ -202,6 +202,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         })
     );
 
+    const watchdog = TunnelWatchdog.getInstance();
+    context.subscriptions.push(new vscode.Disposable(() => watchdog.stop()));
+    watchdog.onStateChange(async () => {
+        await refreshAllStatus();
+    });
+
+    if (isRunningLocally()) {
+        await activateLocal(context);
+    } else {
+        await activateRemote(context);
+    }
+
     // Lifecycle Hook: detect reinstallation or upgrade, and automatically purge stale caches
     const LAST_VERSION_KEY = 'ag-wormhole.lastInstalledVersion';
     const currentVersion = context.extension?.packageJSON?.version || '1.0.0';
@@ -220,18 +232,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await context.globalState.update(LAST_VERSION_KEY, currentVersion);
     }
 
-    if (isRunningLocally()) {
-        await activateLocal(context);
-    } else {
-        await activateRemote(context);
-    }
-
-    // Start High-Availability Tunnel Watchdog
-    const watchdog = TunnelWatchdog.getInstance();
-    context.subscriptions.push(new vscode.Disposable(() => watchdog.stop()));
-    watchdog.onStateChange(async () => {
-        await refreshAllStatus();
-    });
     watchdog.start();
 
     // Auto-refresh interval
@@ -302,12 +302,61 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
     }
 
     const extensionPath = context.extensionUri.fsPath;
-    await Provisioner.ensureExecutablePermissions(extensionPath);
-
     const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
     const remoteHost = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
     const remotePort = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
     const proxyType = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
+
+    // 1. Immediate Fast-Path Zero-Refusal Ingress Shield (T = 0ms):
+    // If primary port is completely unbound at startup, immediately bind IngressRelay (< 5ms)
+    // before any shell calls so early OAuth2 token refresh requests never hit ECONNREFUSED.
+    const initialPrimaryTcpOk = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 200);
+    if (!initialPrimaryTcpOk) {
+        await IngressRelay.getInstance().startRelay(
+            remotePort,
+            remotePort + 1,
+            [remotePort + 1, remotePort + 2, remotePort + 3]
+        );
+    } else {
+        const l7Check = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 500);
+        if (!l7Check.ok) {
+            logger.log(`Pre-emptive Ingress Guard: Primary port ${remotePort} failed L7 check, reclaiming zombie listener...`, false);
+            await Provisioner.reclaimPort(remotePort);
+            await IngressRelay.getInstance().startRelay(
+                remotePort,
+                remotePort + 1,
+                [remotePort + 1, remotePort + 2, remotePort + 3]
+            );
+        }
+    }
+
+    // 2. Auto-inject terminal and extension-host proxy environment variables if enabled
+    const autoInjectTerminal = config.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
+    if (autoInjectTerminal) {
+        const proxyUrl = `http://${remoteHost}:${remotePort}`;
+        const allProxyUrl = `${proxyType}://${remoteHost}:${remotePort}`;
+        process.env.http_proxy = proxyUrl;
+        process.env.https_proxy = proxyUrl;
+        process.env.HTTP_PROXY = proxyUrl;
+        process.env.HTTPS_PROXY = proxyUrl;
+        process.env.all_proxy = allProxyUrl;
+        process.env.ALL_PROXY = allProxyUrl;
+        if (!process.env.no_proxy && !process.env.NO_PROXY) {
+            process.env.no_proxy = 'localhost,127.0.0.1,::1';
+            process.env.NO_PROXY = 'localhost,127.0.0.1,::1';
+        }
+        if (context.environmentVariableCollection) {
+            context.environmentVariableCollection.replace('http_proxy', proxyUrl);
+            context.environmentVariableCollection.replace('https_proxy', proxyUrl);
+            context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
+            context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
+            context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
+            context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
+            logger.log(`Injected proxy environment variables into remote terminals: ${proxyUrl}`, false);
+        }
+    }
+
+    await Provisioner.ensureExecutablePermissions(extensionPath);
 
     context.subscriptions.push(
         vscode.commands.registerCommand(CMD_SETUP, async () => {
@@ -359,32 +408,6 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
             }
         })
     );
-
-    // Auto-inject terminal and extension-host proxy environment variables if enabled
-    const autoInjectTerminal = config.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
-    if (autoInjectTerminal) {
-        const proxyUrl = `http://${remoteHost}:${remotePort}`;
-        const allProxyUrl = `${proxyType}://${remoteHost}:${remotePort}`;
-        process.env.http_proxy = proxyUrl;
-        process.env.https_proxy = proxyUrl;
-        process.env.HTTP_PROXY = proxyUrl;
-        process.env.HTTPS_PROXY = proxyUrl;
-        process.env.all_proxy = allProxyUrl;
-        process.env.ALL_PROXY = allProxyUrl;
-        if (!process.env.no_proxy && !process.env.NO_PROXY) {
-            process.env.no_proxy = 'localhost,127.0.0.1,::1';
-            process.env.NO_PROXY = 'localhost,127.0.0.1,::1';
-        }
-        if (context.environmentVariableCollection) {
-            context.environmentVariableCollection.replace('http_proxy', proxyUrl);
-            context.environmentVariableCollection.replace('https_proxy', proxyUrl);
-            context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
-            context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
-            context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
-            context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
-            logger.log(`Injected proxy environment variables into remote terminals: ${proxyUrl}`, false);
-        }
-    }
 
     // Auto-setup silently
     await Provisioner.runSetupSilently(remoteHost, remotePort, proxyType, extensionPath);

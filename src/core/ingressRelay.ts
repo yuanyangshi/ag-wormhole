@@ -1,7 +1,7 @@
 /**
  * AG-Wormhole - Ingress Relay & Reconnection Bridge
- * Provides zero-downtime TCP port bridging when the primary port encounters
- * SSH forward collisions upon network disconnect and reconnection.
+ * Provides zero-downtime TCP port bridging and dynamic multi-port hunting when
+ * the primary port encounters SSH forward collisions or cold-start delays.
  */
 
 import * as net from 'net';
@@ -10,8 +10,17 @@ import { logger } from '../shared/logger';
 export class IngressRelay {
     private static instance: IngressRelay;
     private server?: net.Server;
+    private standbyGuardServer?: net.Server;
+    private standbyGuardPort?: number;
     private listeningPort?: number;
     private targetPort?: number;
+    private candidatePorts: number[] = [];
+    private transitionChain: Promise<void> = Promise.resolve();
+
+    private readonly maxRounds = 25;
+    private readonly baseRetryDelayMs = 150;
+    private readonly maxPreBufferBytes = 65536;
+    private readonly firstResponseTimeoutMs = 400;
 
     private constructor() {}
 
@@ -35,6 +44,110 @@ export class IngressRelay {
     }
 
     /**
+     * Dynamically update the preferred target port without closing the listening socket
+     */
+    public updateTargetPort(newTargetPort: number): void {
+        this.targetPort = newTargetPort;
+        if (!this.candidatePorts.includes(newTargetPort)) {
+            this.candidatePorts.unshift(newTargetPort);
+        }
+    }
+
+    /**
+     * Perform a fast application-level (L7) proxy verification against a candidate port
+     * to reject dead zombie sshd sockets that accept TCP SYN-ACKs but hang or immediately EOF.
+     */
+    private verifyUpstreamCandidateL7(port: number, timeoutMs: number = 350): Promise<boolean> {
+        return new Promise((resolve) => {
+            const probeSocket = new net.Socket();
+            let settled = false;
+
+            const finish = (ok: boolean) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                probeSocket.removeAllListeners();
+                probeSocket.destroy();
+                resolve(ok);
+            };
+
+            probeSocket.setNoDelay(true);
+            probeSocket.setTimeout(timeoutMs);
+
+            probeSocket.on('connect', () => {
+                try {
+                    probeSocket.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+                } catch {
+                    finish(false);
+                }
+            });
+
+            probeSocket.on('data', (chunk) => {
+                if (chunk && chunk.length > 0) {
+                    finish(true);
+                } else {
+                    finish(false);
+                }
+            });
+
+            probeSocket.on('timeout', () => {
+                finish(false);
+            });
+
+            probeSocket.on('error', () => finish(false));
+            probeSocket.on('close', () => finish(false));
+
+            probeSocket.connect(port, '127.0.0.1');
+        });
+    }
+
+    /**
+     * Hold a temporary standby guard socket on a secondary fallback port (e.g., port+2)
+     * while the primary fallback port (port+1) is free, preventing a single incoming sshd
+     * session from greedily binding all fallback ports simultaneously.
+     */
+    public async ensureStandbyGuard(guardPort: number): Promise<boolean> {
+        if (this.standbyGuardServer && this.standbyGuardPort === guardPort) {
+            return true;
+        }
+        await this.releaseStandbyGuard();
+        if (!guardPort || guardPort <= 0 || guardPort > 65535) {
+            return false;
+        }
+
+        return new Promise((resolve) => {
+            const guard = net.createServer((sock) => {
+                sock.destroy();
+            });
+            guard.on('error', () => {
+                this.standbyGuardServer = undefined;
+                this.standbyGuardPort = undefined;
+                resolve(false);
+            });
+            guard.listen(guardPort, '127.0.0.1', () => {
+                this.standbyGuardServer = guard;
+                this.standbyGuardPort = guardPort;
+                resolve(true);
+            });
+        });
+    }
+
+    /**
+     * Release the standby guard socket so the next reconnecting sshd session can bind it
+     */
+    public async releaseStandbyGuard(): Promise<void> {
+        if (this.standbyGuardServer) {
+            const g = this.standbyGuardServer;
+            this.standbyGuardServer = undefined;
+            this.standbyGuardPort = undefined;
+            await new Promise<void>((resolve) => {
+                g.close(() => resolve());
+            });
+        }
+    }
+
+    /**
      * Temporarily suspend the relay for a brief duration (yielding the listening port)
      * and allow inspection or takeover by the native SSH daemon.
      */
@@ -42,8 +155,6 @@ export class IngressRelay {
         if (!this.isRelaying()) {
             return;
         }
-        const currentTarget = this.targetPort;
-        const currentListen = this.listeningPort;
         await this.stopRelay();
         if (durationMs > 0) {
             await new Promise((resolve) => setTimeout(resolve, durationMs));
@@ -51,49 +162,273 @@ export class IngressRelay {
     }
 
     /**
-     * Start local TCP bridge forwarding all traffic from listenPort to active targetPort
+     * Build ordered list of upstream candidate ports to probe when connecting
      */
-    public async startRelay(listenPort: number, targetPort: number): Promise<boolean> {
-        if (this.isRelaying() && this.listeningPort === listenPort && this.targetPort === targetPort) {
+    private getOrderedCandidatePorts(defaultTarget: number, listenPort: number): number[] {
+        const currentTarget = this.targetPort || defaultTarget;
+        const set = new Set<number>();
+        if (currentTarget !== listenPort && currentTarget > 0 && currentTarget <= 65535) {
+            set.add(currentTarget);
+        }
+        for (const p of this.candidatePorts) {
+            if (p !== listenPort && p > 0 && p <= 65535) {
+                set.add(p);
+            }
+        }
+        // Automatically include standard cluster fallback offsets relative to listenPort
+        for (let offset = 1; offset <= 3; offset++) {
+            const fp = listenPort + offset;
+            if (fp !== listenPort && fp > 0 && fp <= 65535) {
+                set.add(fp);
+            }
+        }
+        if (set.size === 0 && defaultTarget > 0 && defaultTarget <= 65535) {
+            set.add(defaultTarget);
+        }
+        return Array.from(set);
+    }
+
+    /**
+     * Start local TCP bridge forwarding all traffic from listenPort to active targetPort.
+     * Incorporates dynamic multi-port hunting, First-Response-Verified Replay Buffering,
+     * zombie/blackhole socket detection, and extended connection holding (~6.0s window)
+     * to completely absorb cold-start races and transient network flickers without ever
+     * returning ECONNREFUSED or dropping initial OAuth2/HTTP payloads.
+     */
+    public async startRelay(listenPort: number, targetPort: number, candidates?: number[]): Promise<boolean> {
+        let result = false;
+        this.transitionChain = this.transitionChain.then(async () => {
+            result = await this.startRelayInternal(listenPort, targetPort, candidates);
+        }).catch(() => {
+            result = false;
+        });
+        await this.transitionChain;
+        return result;
+    }
+
+    private async startRelayInternal(listenPort: number, targetPort: number, candidates?: number[]): Promise<boolean> {
+        if (candidates && candidates.length > 0) {
+            this.candidatePorts = [...candidates];
+        } else {
+            this.candidatePorts = [targetPort, listenPort + 1, listenPort + 2, listenPort + 3].filter(
+                (p, idx, arr) => p !== listenPort && p > 0 && p <= 65535 && arr.indexOf(p) === idx
+            );
+        }
+
+        if (this.isRelaying() && this.listeningPort === listenPort) {
+            this.targetPort = targetPort;
             return true;
         }
 
-        await this.stopRelay();
+        await this.stopRelayInternal();
 
+        for (let bindAttempt = 0; bindAttempt < 6; bindAttempt++) {
+            const bound = await this.tryBindRelayServer(listenPort, targetPort);
+            if (bound) {
+                return true;
+            }
+            if (bindAttempt < 5) {
+                await new Promise((r) => setTimeout(r, 25));
+            }
+        }
+        return false;
+    }
+
+    private tryBindRelayServer(listenPort: number, targetPort: number): Promise<boolean> {
         return new Promise((resolve) => {
-            const server = net.createServer({ pauseOnConnect: true }, (clientSocket) => {
-                const targetSocket = new net.Socket();
+            const server = net.createServer({ pauseOnConnect: true, allowHalfOpen: true }, (clientSocket) => {
                 clientSocket.setNoDelay(true);
                 clientSocket.setKeepAlive(true, 15000);
-                targetSocket.setNoDelay(true);
-                targetSocket.setKeepAlive(true, 15000);
 
-                targetSocket.connect(targetPort, '127.0.0.1', () => {
-                    clientSocket.pipe(targetSocket);
-                    targetSocket.pipe(clientSocket);
-                    clientSocket.resume();
-                });
+                let round = 0;
+                let activeTargetSocket: net.Socket | null = null;
+                let isPiped = false;
+                let isConnectedToCandidate = false;
+                let totalBufferedBytes = 0;
+                const clientPreBuffer: Buffer[] = [];
+                let firstResponseTimer: NodeJS.Timeout | null = null;
 
-                const cleanup = () => {
-                    if (!clientSocket.destroyed) {
-                        clientSocket.destroy();
-                    }
-                    if (!targetSocket.destroyed) {
-                        targetSocket.destroy();
+                const clearResponseTimer = () => {
+                    if (firstResponseTimer) {
+                        clearTimeout(firstResponseTimer);
+                        firstResponseTimer = null;
                     }
                 };
 
-                clientSocket.on('error', cleanup);
-                targetSocket.on('error', cleanup);
-                clientSocket.on('close', cleanup);
-                targetSocket.on('close', cleanup);
+                // Capture initial client request bytes into replay buffer until upstream candidate responds
+                const onClientInitialData = (chunk: Buffer) => {
+                    if (isPiped) {
+                        return;
+                    }
+                    if (totalBufferedBytes + chunk.length <= this.maxPreBufferBytes) {
+                        clientPreBuffer.push(Buffer.from(chunk));
+                        totalBufferedBytes += chunk.length;
+                    }
+                    if (isConnectedToCandidate && activeTargetSocket && !activeTargetSocket.destroyed) {
+                        try {
+                            activeTargetSocket.write(chunk);
+                        } catch {
+                            // Handled by targetSocket error/close
+                        }
+                    }
+                };
+
+                clientSocket.on('data', onClientInitialData);
+                clientSocket.resume();
+
+                const tryHuntAndConnect = (candidateIdx: number) => {
+                    if (clientSocket.destroyed || isPiped) {
+                        return;
+                    }
+
+                    const orderedPorts = this.getOrderedCandidatePorts(targetPort, listenPort);
+                    if (candidateIdx >= orderedPorts.length) {
+                        round++;
+                        if (round < this.maxRounds && !clientSocket.destroyed) {
+                            const delay = Math.min(350, this.baseRetryDelayMs + round * 15);
+                            setTimeout(() => tryHuntAndConnect(0), delay);
+                        } else if (!clientSocket.destroyed) {
+                            clientSocket.destroy();
+                        }
+                        return;
+                    }
+
+                    const candidatePort = orderedPorts[candidateIdx];
+                    if (this.standbyGuardPort === candidatePort) {
+                        tryHuntAndConnect(candidateIdx + 1);
+                        return;
+                    }
+
+                    const targetSocket = new net.Socket();
+                    activeTargetSocket = targetSocket;
+                    isConnectedToCandidate = false;
+                    targetSocket.setNoDelay(true);
+                    targetSocket.setKeepAlive(true, 15000);
+                    targetSocket.setTimeout(700);
+
+                    let graceTimer: NodeJS.Timeout | null = null;
+
+                    const commitVerifiedPipe = (initialUpstreamChunk?: Buffer) => {
+                        if (isPiped || clientSocket.destroyed || targetSocket.destroyed) {
+                            return;
+                        }
+                        if (graceTimer) {
+                            clearTimeout(graceTimer);
+                            graceTimer = null;
+                        }
+                        clearResponseTimer();
+                        targetSocket.setTimeout(0);
+                        isPiped = true;
+                        this.targetPort = candidatePort;
+
+                        clientSocket.removeListener('data', onClientInitialData);
+                        clientPreBuffer.length = 0;
+
+                        if (initialUpstreamChunk && initialUpstreamChunk.length > 0) {
+                            clientSocket.write(initialUpstreamChunk);
+                        }
+                        clientSocket.pipe(targetSocket);
+                        targetSocket.pipe(clientSocket);
+                    };
+
+                    const onCandidateFail = () => {
+                        if (graceTimer) {
+                            clearTimeout(graceTimer);
+                            graceTimer = null;
+                        }
+                        clearResponseTimer();
+                        isConnectedToCandidate = false;
+                        targetSocket.removeAllListeners();
+                        targetSocket.destroy();
+                        if (isPiped) {
+                            if (!clientSocket.destroyed) {
+                                clientSocket.destroy();
+                            }
+                            return;
+                        }
+                        if (!clientSocket.destroyed) {
+                            // Immediately try the next candidate port in the cluster and replay clientPreBuffer
+                            tryHuntAndConnect(candidateIdx + 1);
+                        }
+                    };
+
+                    targetSocket.connect(candidatePort, '127.0.0.1', () => {
+                        // Guard against zombie sshd ports that complete TCP 3-way handshake
+                        // and then either immediately send FIN/RST or swallow the request as a half-open blackhole.
+                        graceTimer = setTimeout(() => {
+                            if (isPiped || clientSocket.destroyed || targetSocket.destroyed) {
+                                return;
+                            }
+                            isConnectedToCandidate = true;
+                            if (clientPreBuffer.length > 0) {
+                                try {
+                                    targetSocket.write(Buffer.concat(clientPreBuffer));
+                                } catch {
+                                    onCandidateFail();
+                                    return;
+                                }
+                            }
+                            // Wait for the first upstream response byte; if candidate hangs silently
+                            // (half-open blackhole sshd), fail over and replay clientPreBuffer to the next port.
+                            clearResponseTimer();
+                            firstResponseTimer = setTimeout(() => {
+                                if (!isPiped) {
+                                    if (totalBufferedBytes > 0) {
+                                        onCandidateFail();
+                                    } else {
+                                        commitVerifiedPipe();
+                                    }
+                                }
+                            }, this.firstResponseTimeoutMs);
+                        }, 15);
+                    });
+
+                    targetSocket.on('data', (chunk: Buffer) => {
+                        if (!isPiped) {
+                            commitVerifiedPipe(chunk);
+                        }
+                    });
+
+                    targetSocket.on('timeout', () => {
+                        if (!isPiped) {
+                            onCandidateFail();
+                        }
+                    });
+                    targetSocket.on('error', onCandidateFail);
+                    targetSocket.on('end', () => {
+                        if (!isPiped) {
+                            onCandidateFail();
+                        } else if (!clientSocket.destroyed) {
+                            clientSocket.end();
+                        }
+                    });
+                    targetSocket.on('close', () => {
+                        if (!isPiped) {
+                            onCandidateFail();
+                        } else if (!clientSocket.destroyed) {
+                            clientSocket.destroy();
+                        }
+                    });
+                };
+
+                clientSocket.on('error', () => {
+                    clearResponseTimer();
+                    if (activeTargetSocket && !activeTargetSocket.destroyed) {
+                        activeTargetSocket.destroy();
+                    }
+                });
+                clientSocket.on('close', () => {
+                    clearResponseTimer();
+                    if (activeTargetSocket && !activeTargetSocket.destroyed) {
+                        activeTargetSocket.destroy();
+                    }
+                });
+
+                tryHuntAndConnect(0);
             });
 
             server.on('error', (err: { message?: string }) => {
-                logger.log(`IngressRelay failed on port ${listenPort}: ${err.message}`, false);
-                this.server = undefined;
-                this.listeningPort = undefined;
-                this.targetPort = undefined;
+                logger.log(`IngressRelay bind attempt on port ${listenPort}: ${err.message}`, false);
                 resolve(false);
             });
 
@@ -101,7 +436,7 @@ export class IngressRelay {
                 this.server = server;
                 this.listeningPort = listenPort;
                 this.targetPort = targetPort;
-                logger.log(`IngressRelay activated: bridging local 127.0.0.1:${listenPort} -> live tunnel 127.0.0.1:${targetPort}`, false);
+                logger.log(`IngressRelay activated: holding 127.0.0.1:${listenPort} -> hunting cluster [primary target: ${targetPort}]`, false);
                 resolve(true);
             });
         });
@@ -111,6 +446,14 @@ export class IngressRelay {
      * Stop active relay and release the listening port
      */
     public async stopRelay(): Promise<void> {
+        this.transitionChain = this.transitionChain.then(async () => {
+            await this.stopRelayInternal();
+        }).catch(() => {});
+        await this.transitionChain;
+    }
+
+    private async stopRelayInternal(): Promise<void> {
+        await this.releaseStandbyGuard();
         if (this.server) {
             const s = this.server;
             this.server = undefined;

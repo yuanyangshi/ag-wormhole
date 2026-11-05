@@ -45,11 +45,13 @@ export interface IDisposable {
 export class TunnelWatchdog {
     private static instance: TunnelWatchdog;
     private timer?: NodeJS.Timeout;
+    private fastPathTimers: NodeJS.Timeout[] = [];
     private metrics: WatchdogMetrics;
     private stateChangeCallbacks: ((metrics: WatchdogMetrics) => void)[] = [];
     private isProbing = false;
     private probeCount = 0;
-    private readonly checkIntervalMs = 10000; // 10s non-intrusive probe
+    private checkIntervalMs = 10000; // default 10s non-intrusive probe
+    private readonly fastRecoveryIntervalMs = 2500; // 2.5s fast-path self-healing probe
     private readonly failureThreshold = 2; // trigger recovery early after 2 consecutive failures
     private readonly reclaimCooldownMs = 15000; // 15s between automatic port reclaim attempts
 
@@ -80,15 +82,36 @@ export class TunnelWatchdog {
             // Standalone test context
         }
 
-        const intervalMs = intervalSec * 1000;
-        logger.log(`Starting High-Availability Tunnel Watchdog (interval: ${intervalSec}s)`, isRunningLocally());
+        this.checkIntervalMs = intervalSec * 1000;
+        logger.log(`Starting High-Availability Tunnel Watchdog (interval: ${intervalSec}s, adaptive fast-recovery: 2.5s)`, isRunningLocally());
         
         // Immediate initial check
         this.probe();
 
+        // Fast-path startup burst: probe at 250ms, 750ms, and 1600ms to immediately lock on live reverse tunnels
+        const fastDelays = [250, 750, 1600];
+        for (const delay of fastDelays) {
+            const t = setTimeout(() => {
+                this.probe();
+            }, delay);
+            this.fastPathTimers.push(t);
+        }
+
+        this.scheduleNextProbe();
+    }
+
+    private scheduleNextProbe(): void {
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = undefined;
+        }
+
+        const isUnhealthy = this.metrics.state === 'DEGRADED' || this.metrics.state === 'DISCONNECTED';
+        const delayMs = isUnhealthy ? this.fastRecoveryIntervalMs : this.checkIntervalMs;
+
         this.timer = setInterval(() => {
             this.probe();
-        }, intervalMs);
+        }, delayMs);
     }
 
     public stop(): void {
@@ -96,6 +119,10 @@ export class TunnelWatchdog {
             clearInterval(this.timer);
             this.timer = undefined;
         }
+        for (const ft of this.fastPathTimers) {
+            clearTimeout(ft);
+        }
+        this.fastPathTimers = [];
     }
 
     public onStateChange(callback: (metrics: WatchdogMetrics) => void): IDisposable {
@@ -143,27 +170,18 @@ export class TunnelWatchdog {
             }
 
             // Autonomous Relay Yielding & Native Port Reclaim Probe:
-            // When traffic is being bridged via a fallback port, periodically yield IngressRelay
-            // to allow any newly connected SSH session to re-bind the primary native port.
-            if (isRunningRemotely() && IngressRelay.getInstance().isRelaying() && this.probeCount % 5 === 0) {
+            // Only yield IngressRelay if an external process (like sshd) is already bound to remotePort
+            // or if we never drop the listening socket on remotePort while active sessions rely on it.
+            // Keeping IngressRelay continuously bound when relaying eliminates the 150ms+ ECONNREFUSED window
+            // during periodic health probes.
+            if (isRunningRemotely() && IngressRelay.getInstance().isRelaying() && this.metrics.state === 'HEALTHY') {
                 const targetFp = IngressRelay.getInstance().getRelayInfo().targetPort;
-                await IngressRelay.getInstance().stopRelay();
-                await new Promise((r) => setTimeout(r, 200));
-
-                const nativeReachable = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 1500);
-                let nativeHealthy = false;
-                if (nativeReachable) {
-                    const primaryL7 = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 2000);
-                    nativeHealthy = primaryL7.ok;
-                }
-
-                if (nativeHealthy) {
-                    logger.log(`Tunnel Watchdog: Native primary SSH tunnel restored on port ${remotePort}. Reclaimed successfully from bridge relay.`, false);
-                    this.metrics.isRelaying = false;
-                    this.metrics.activeTunnelPort = remotePort;
-                } else if (targetFp) {
-                    // Native primary port not yet ready, immediately restore the bridge
-                    await IngressRelay.getInstance().startRelay(remotePort, targetFp);
+                if (targetFp) {
+                    const targetL7 = await TunnelManager.checkProxyL7(remoteHost, targetFp, proxyType, 1800);
+                    if (!targetL7.ok) {
+                        // Current relay target degraded; force immediate re-hunt across fallback cluster
+                        logger.log(`Tunnel Watchdog: Relay target port ${targetFp} degraded, re-hunting fallback cluster...`, false);
+                    }
                 }
             }
 
@@ -177,13 +195,16 @@ export class TunnelWatchdog {
 
             let l7Result: { ok: boolean; message: string } | undefined;
             if (isReachable) {
+                // Always run fast L7 verification on remote hosts because a dead/zombie sshd
+                // still completes local TCP 3-way handshakes even when the SSH tunnel is dead.
                 const shouldRunL7 =
+                    isRunningRemotely() ||
                     this.metrics.state !== 'HEALTHY' ||
                     this.metrics.l7Health === undefined ||
                     this.probeCount % 6 === 1;
 
                 if (shouldRunL7) {
-                    l7Result = await TunnelManager.checkProxyL7(targetHost, probePort, proxyType, 3000);
+                    l7Result = await TunnelManager.checkProxyL7(targetHost, probePort, proxyType, 2200);
                 } else {
                     l7Result = {
                         ok: true,
@@ -196,14 +217,10 @@ export class TunnelWatchdog {
             // If primary remote port is unavailable (or held by a dead zombie sshd from a previous session
             // while a new sshd bound to one of the fallback ports), bridge traffic via IngressRelay.
             if (isRunningRemotely() && (!isReachable || !l7Result?.ok)) {
-                // If currently relaying but the tunnel is broken, reset relay so ports can be re-evaluated
-                if (this.metrics.isRelaying) {
-                    await IngressRelay.getInstance().stopRelay();
-                    this.metrics.isRelaying = false;
-                }
-
-                const primaryPids = isReachable ? await Provisioner.getListeningPids(remotePort) : [];
+                const wasRelaying = IngressRelay.getInstance().isRelaying();
+                const primaryPids = (!wasRelaying && isReachable) ? await Provisioner.getListeningPids(remotePort) : [];
                 const fallbackPorts = [remotePort + 1, remotePort + 2, remotePort + 3];
+                let recoveredViaFallback = false;
 
                 for (const fp of fallbackPorts) {
                     if (fp === probePort && !isReachable) {
@@ -221,27 +238,56 @@ export class TunnelWatchdog {
                         continue;
                     }
 
-                    const fpReachable = await TunnelManager.checkPortAvailable(remoteHost, fp, 2000);
+                    const fpReachable = await TunnelManager.checkPortAvailable(remoteHost, fp, 1500);
                     if (fpReachable) {
-                        const fpL7 = await TunnelManager.checkProxyL7(remoteHost, fp, proxyType, 2500);
+                        const fpL7 = await TunnelManager.checkProxyL7(remoteHost, fp, proxyType, 2000);
                         if (fpL7.ok) {
                             logger.log(`Tunnel Watchdog: Detected active fallback SSH tunnel on port ${fp}. Auto-healing primary port ${remotePort}...`, false);
-                            await Provisioner.reclaimPort(remotePort);
-                            await new Promise(r => setTimeout(r, 150));
-                            const relaySuccess = await IngressRelay.getInstance().startRelay(remotePort, fp);
-                            if (relaySuccess) {
+                            if (wasRelaying) {
+                                IngressRelay.getInstance().updateTargetPort(fp);
                                 l7Result = { ok: true, message: `Relayed via active tunnel port ${fp}` };
                                 this.metrics.activeTunnelPort = fp;
                                 this.metrics.isRelaying = true;
+                                recoveredViaFallback = true;
                                 break;
+                            } else {
+                                await Provisioner.reclaimPort(remotePort);
+                                const relaySuccess = await IngressRelay.getInstance().startRelay(remotePort, fp, fallbackPorts);
+                                if (relaySuccess) {
+                                    l7Result = { ok: true, message: `Relayed via active tunnel port ${fp}` };
+                                    this.metrics.activeTunnelPort = fp;
+                                    this.metrics.isRelaying = true;
+                                    recoveredViaFallback = true;
+                                    break;
+                                }
                             }
                         }
                     }
+                }
+
+                // If no fallback port is healthy yet, ensure the Zero-Refusal Ingress Shield remains active
+                // on remotePort so incoming requests wait in the buffer rather than getting ECONNREFUSED.
+                if (!recoveredViaFallback && !IngressRelay.getInstance().isRelaying()) {
+                    await Provisioner.reclaimPort(remotePort);
+                    await IngressRelay.getInstance().startRelay(remotePort, remotePort + 1, fallbackPorts);
+                }
+            }
+
+            // Ping-Pong Standby Port Guard management:
+            // When IngressRelay owns remotePort, ensure at least one fallback port (remotePort+2) is
+            // reserved in standby while remotePort+1 is unbound, and released once remotePort+1 is bound.
+            if (isRunningRemotely() && IngressRelay.getInstance().isRelaying()) {
+                const fp1Bound = await TunnelManager.checkPortAvailable(remoteHost, remotePort + 1, 200);
+                if (fp1Bound) {
+                    await IngressRelay.getInstance().releaseStandbyGuard();
+                } else {
+                    await IngressRelay.getInstance().ensureStandbyGuard(remotePort + 2);
                 }
             }
 
             const effectiveReachable = isReachable || Boolean(this.metrics.isRelaying && l7Result?.ok);
 
+            const prevState = this.metrics.state;
             if (effectiveReachable && l7Result?.ok) {
                 this.metrics.l7Health = true;
                 this.metrics.l7Message = l7Result.message;
@@ -250,13 +296,17 @@ export class TunnelWatchdog {
                     : (isRunningRemotely() ? remotePort : localPort);
                 this.metrics.isRelaying = IngressRelay.getInstance().isRelaying();
 
-                const wasDisconnected = this.metrics.state === 'DISCONNECTED';
-                if (this.metrics.state !== 'HEALTHY') {
+                const wasDisconnected = prevState === 'DISCONNECTED';
+                if (prevState !== 'HEALTHY') {
                     logger.log(`Tunnel Watchdog: Connection verified HEALTHY (Port ${this.metrics.activeTunnelPort}${this.metrics.isRelaying ? ' via bridge' : ''})`, isRunningLocally());
                 }
                 this.metrics.consecutiveFailures = 0;
                 this.metrics.state = 'HEALTHY';
                 this.metrics.reconnectPromptShown = false;
+
+                if (prevState !== 'HEALTHY') {
+                    this.scheduleNextProbe();
+                }
 
                 if (isRunningLocally()) {
                     try {
@@ -281,7 +331,16 @@ export class TunnelWatchdog {
             } else if (effectiveReachable && !l7Result?.ok) {
                 this.metrics.l7Health = false;
                 this.metrics.l7Message = l7Result?.message || 'L7 handshake failed';
-                this.metrics.state = 'DEGRADED';
+                this.metrics.consecutiveFailures++;
+                if (isRunningRemotely() && this.metrics.consecutiveFailures >= this.failureThreshold) {
+                    this.metrics.state = 'DISCONNECTED';
+                    await this.handleTunnelDisconnection(remotePort);
+                } else {
+                    this.metrics.state = 'DEGRADED';
+                }
+                if (prevState === 'HEALTHY') {
+                    this.scheduleNextProbe();
+                }
                 logger.log(`Tunnel Watchdog: Port open but L7 proxy probe degraded: ${this.metrics.l7Message}`, isRunningLocally());
             } else {
                 this.metrics.l7Health = false;
@@ -292,6 +351,9 @@ export class TunnelWatchdog {
                     await this.handleTunnelDisconnection(remotePort);
                 } else {
                     this.metrics.state = 'DEGRADED';
+                }
+                if (prevState === 'HEALTHY') {
+                    this.scheduleNextProbe();
                 }
                 logger.log(
                     `Tunnel Watchdog probe failed (consecutive failures: ${this.metrics.consecutiveFailures})`,
@@ -335,6 +397,13 @@ export class TunnelWatchdog {
                 const result = await Provisioner.reclaimPortRange(remotePort, 4);
                 if (result.success && result.pidsKilled.length > 0) {
                     logger.log(`Tunnel Watchdog: Terminated ${result.pidsKilled.length} zombie process(es): ${result.pidsKilled.join(', ')}`, false);
+                }
+                if (!IngressRelay.getInstance().isRelaying()) {
+                    await IngressRelay.getInstance().startRelay(
+                        remotePort,
+                        remotePort + 1,
+                        [remotePort + 1, remotePort + 2, remotePort + 3]
+                    );
                 }
             }
 

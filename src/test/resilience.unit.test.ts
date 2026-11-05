@@ -177,6 +177,242 @@ suite('Resilience & Stability Unit Tests', () => {
         await new Promise<void>((res) => targetServer.close(() => res()));
     });
 
+    test('IngressRelay buffers connection and successfully recovers when upstream target is delayed', async () => {
+        const relay = IngressRelay.getInstance();
+        const dummyServer = net.createServer();
+        await new Promise<void>((res) => dummyServer.listen(0, '127.0.0.1', () => res()));
+        const listenPort = (dummyServer.address() as net.AddressInfo).port;
+        await new Promise<void>((res) => dummyServer.close(() => res()));
+
+        const targetDummy = net.createServer();
+        await new Promise<void>((res) => targetDummy.listen(0, '127.0.0.1', () => res()));
+        const targetPort = (targetDummy.address() as net.AddressInfo).port;
+        await new Promise<void>((res) => targetDummy.close(() => res()));
+
+        // Start relay before target is actually listening
+        await relay.startRelay(listenPort, targetPort);
+
+        // Bring target up after 180ms delay
+        setTimeout(() => {
+            const upstream = net.createServer((sock) => {
+                sock.on('data', (d) => sock.write(`ECHO_${d.toString()}`));
+            });
+            upstream.listen(targetPort, '127.0.0.1');
+            setTimeout(() => {
+                upstream.close();
+            }, 1000);
+        }, 180);
+
+        // Client connects immediately; retry buffer holds connection until upstream is ready
+        const client = new net.Socket();
+        const responseData = await new Promise<string>((resolve, reject) => {
+            client.connect(listenPort, '127.0.0.1', () => {
+                client.write('BUFFER_TEST');
+            });
+            client.on('data', (chunk) => {
+                client.destroy();
+                resolve(chunk.toString());
+            });
+            client.on('error', (err) => reject(err));
+        });
+
+        assert.strictEqual(responseData, 'ECHO_BUFFER_TEST');
+        await relay.stopRelay();
+    });
+
+    test('IngressRelay dynamically hunts across candidate fallback ports when primary target is down', async () => {
+        const relay = IngressRelay.getInstance();
+
+        // Allocate 3 dynamic ephemeral ports: listenPort, deadCandidatePort, liveCandidatePort
+        const getFreePort = async (): Promise<number> => {
+            const s = net.createServer();
+            await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+            const p = (s.address() as net.AddressInfo).port;
+            await new Promise<void>((res) => s.close(() => res()));
+            return p;
+        };
+
+        const listenPort = await getFreePort();
+        const deadPort = await getFreePort();
+
+        // Start a live upstream server on livePort
+        const liveServer = net.createServer((sock) => {
+            sock.on('data', (d) => sock.write(`HUNT_OK_${d.toString()}`));
+        });
+        await new Promise<void>((res) => liveServer.listen(0, '127.0.0.1', () => res()));
+        const livePort = (liveServer.address() as net.AddressInfo).port;
+
+        try {
+            // Start relay pointing to deadPort as primary target, but with [deadPort, livePort] in candidates
+            const started = await relay.startRelay(listenPort, deadPort, [deadPort, livePort]);
+            assert.strictEqual(started, true);
+
+            const client = new net.Socket();
+            const responseData = await new Promise<string>((resolve, reject) => {
+                client.connect(listenPort, '127.0.0.1', () => {
+                    client.write('PAYLOAD');
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk.toString());
+                });
+                client.on('error', (err) => reject(err));
+            });
+
+            assert.strictEqual(responseData, 'HUNT_OK_PAYLOAD');
+            // Verify IngressRelay automatically locked onto the live candidate port
+            assert.strictEqual(relay.getRelayInfo().targetPort, livePort);
+        } finally {
+            await relay.stopRelay();
+            await new Promise<void>((res) => liveServer.close(() => res()));
+        }
+    });
+
+    test('IngressRelay bypasses zombie candidate that immediately closes after TCP connect and fails over to live candidate', async () => {
+        const relay = IngressRelay.getInstance();
+
+        const getFreePort = async (): Promise<number> => {
+            const s = net.createServer();
+            await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+            const p = (s.address() as net.AddressInfo).port;
+            await new Promise<void>((res) => s.close(() => res()));
+            return p;
+        };
+
+        const listenPort = await getFreePort();
+
+        // Zombie server: accepts TCP connection and immediately closes (simulating dead sshd RemoteForward)
+        const zombieServer = net.createServer((sock) => {
+            sock.destroy();
+        });
+        await new Promise<void>((res) => zombieServer.listen(0, '127.0.0.1', () => res()));
+        const zombiePort = (zombieServer.address() as net.AddressInfo).port;
+
+        // Live server: responds properly
+        const liveServer = net.createServer((sock) => {
+            sock.on('data', (d) => sock.write(`ZOMBIE_BYPASSED_${d.toString()}`));
+        });
+        await new Promise<void>((res) => liveServer.listen(0, '127.0.0.1', () => res()));
+        const livePort = (liveServer.address() as net.AddressInfo).port;
+
+        try {
+            const started = await relay.startRelay(listenPort, zombiePort, [zombiePort, livePort]);
+            assert.strictEqual(started, true);
+
+            const client = new net.Socket();
+            const responseData = await new Promise<string>((resolve, reject) => {
+                client.connect(listenPort, '127.0.0.1', () => {
+                    client.write('OAUTH_TOKEN_REQ');
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk.toString());
+                });
+                client.on('error', (err) => reject(err));
+            });
+
+            assert.strictEqual(responseData, 'ZOMBIE_BYPASSED_OAUTH_TOKEN_REQ');
+            assert.strictEqual(relay.getRelayInfo().targetPort, livePort);
+        } finally {
+            await relay.stopRelay();
+            await new Promise<void>((res) => zombieServer.close(() => res()));
+            await new Promise<void>((res) => liveServer.close(() => res()));
+        }
+    });
+
+    test('IngressRelay replays buffered initial payload when half-open blackhole zombie swallows request without responding', async () => {
+        const relay = IngressRelay.getInstance();
+
+        const getFreePort = async (): Promise<number> => {
+            const s = net.createServer();
+            await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+            const p = (s.address() as net.AddressInfo).port;
+            await new Promise<void>((res) => s.close(() => res()));
+            return p;
+        };
+
+        const listenPort = await getFreePort();
+
+        // Delayed-close zombie: accepts TCP, reads the request, waits 60ms (WAN RTT), and closes without replying
+        const delayedZombieSockets: net.Socket[] = [];
+        const delayedZombieServer = net.createServer((sock) => {
+            delayedZombieSockets.push(sock);
+            sock.on('data', () => {
+                setTimeout(() => sock.destroy(), 60);
+            });
+        });
+        await new Promise<void>((res) => delayedZombieServer.listen(0, '127.0.0.1', () => res()));
+        const delayedZombiePort = (delayedZombieServer.address() as net.AddressInfo).port;
+
+        // Silent blackhole zombie: accepts TCP, reads the request, and hangs silently forever
+        const blackholeSockets: net.Socket[] = [];
+        const blackholeServer = net.createServer((sock) => {
+            blackholeSockets.push(sock);
+            sock.on('data', () => {
+                // Intentionally never respond and never close (half-open dead sshd blackhole)
+            });
+        });
+        await new Promise<void>((res) => blackholeServer.listen(0, '127.0.0.1', () => res()));
+        const blackholePort = (blackholeServer.address() as net.AddressInfo).port;
+
+        // Live server: responds properly
+        const liveServer = net.createServer((sock) => {
+            sock.on('data', (d) => sock.write(`REPLAY_OK_${d.toString()}`));
+        });
+        await new Promise<void>((res) => liveServer.listen(0, '127.0.0.1', () => res()));
+        const livePort = (liveServer.address() as net.AddressInfo).port;
+
+        try {
+            const started = await relay.startRelay(
+                listenPort,
+                delayedZombiePort,
+                [delayedZombiePort, blackholePort, livePort]
+            );
+            assert.strictEqual(started, true);
+
+            const client = new net.Socket();
+            const responseData = await new Promise<string>((resolve, reject) => {
+                client.connect(listenPort, '127.0.0.1', () => {
+                    client.write('OAUTH_REPLAY_PAYLOAD');
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk.toString());
+                });
+                client.on('error', (err) => reject(err));
+            });
+
+            assert.strictEqual(responseData, 'REPLAY_OK_OAUTH_REPLAY_PAYLOAD');
+            assert.strictEqual(relay.getRelayInfo().targetPort, livePort);
+        } finally {
+            await relay.stopRelay();
+            for (const s of [...delayedZombieSockets, ...blackholeSockets]) {
+                s.destroy();
+            }
+            await new Promise<void>((res) => delayedZombieServer.close(() => res()));
+            await new Promise<void>((res) => blackholeServer.close(() => res()));
+            await new Promise<void>((res) => liveServer.close(() => res()));
+        }
+    });
+
+    test('IngressRelay standby guard reserves fallback port and releases cleanly', async () => {
+        const relay = IngressRelay.getInstance();
+        const s = net.createServer();
+        await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+        const guardPort = (s.address() as net.AddressInfo).port;
+        await new Promise<void>((res) => s.close(() => res()));
+
+        const guarded = await relay.ensureStandbyGuard(guardPort);
+        assert.strictEqual(guarded, true);
+
+        const isBoundWhileGuarded = await TunnelManager.checkPortAvailable('127.0.0.1', guardPort, 300);
+        assert.strictEqual(isBoundWhileGuarded, true);
+
+        await relay.releaseStandbyGuard();
+        const isBoundAfterRelease = await TunnelManager.checkPortAvailable('127.0.0.1', guardPort, 300);
+        assert.strictEqual(isBoundAfterRelease, false);
+    });
+
     test('TunnelManager.parseSshCommandDestination accurately extracts interactive and keeper SSH targets', () => {
         const remoteSshCmd = 'ssh -v -T -D 54102 remote-host "bash -s"';
         const parsed1 = TunnelManager.parseSshCommandDestination(remoteSshCmd);
