@@ -6,15 +6,20 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as net from 'net';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { logger } from '../shared/logger';
 import { LanguageServerProcessInfo } from '../shared/types';
 import { getSystemArchitecture } from '../shared/environment';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export class Provisioner {
+    private static cachedLsInfo: { info: LanguageServerProcessInfo; timestamp: number } | null = null;
+    private static cachedMgraftcpRunning: { running: boolean; timestamp: number } | null = null;
+    private static cachedAgyConfigured: { configured: boolean; timestamp: number } | null = null;
+
     /**
      * Ensure executable permissions for engine binaries
      */
@@ -24,7 +29,7 @@ export class Provisioner {
         const binaryPath = path.join(extensionPath, 'resources', 'bin', binaryName);
 
         try {
-            await execAsync(`chmod +x "${binaryPath}"`);
+            await fs.chmod(binaryPath, 0o755);
             logger.log(`Set executable flag on engine binary: ${binaryPath}`, false);
         } catch (error) {
             logger.log(`Notice: Could not chmod ${binaryPath}: ${error}`, false);
@@ -34,11 +39,18 @@ export class Provisioner {
     /**
      * Probe whether mgraftcp is currently executing
      */
-    public static async isMgraftcpRunning(): Promise<boolean> {
+    public static async isMgraftcpRunning(forceRefresh: boolean = false): Promise<boolean> {
+        const now = Date.now();
+        if (!forceRefresh && Provisioner.cachedMgraftcpRunning && now - Provisioner.cachedMgraftcpRunning.timestamp < 30000) {
+            return Provisioner.cachedMgraftcpRunning.running;
+        }
         try {
-            const { stdout } = await execAsync('pgrep -f "[m]graftcp-fakedns"');
-            return stdout.trim().length > 0;
+            const { stdout } = await execFileAsync('pgrep', ['-f', '[m]graftcp-fakedns'], { timeout: 2000 });
+            const running = stdout.trim().length > 0;
+            Provisioner.cachedMgraftcpRunning = { running, timestamp: now };
+            return running;
         } catch {
+            Provisioner.cachedMgraftcpRunning = { running: false, timestamp: now };
             return false;
         }
     }
@@ -46,7 +58,11 @@ export class Provisioner {
     /**
      * Check whether modern Antigravity AGY runtime is installed and synchronized with AG-Wormhole
      */
-    public static async isAgyRuntimeConfigured(): Promise<boolean> {
+    public static async isAgyRuntimeConfigured(forceRefresh: boolean = false): Promise<boolean> {
+        const now = Date.now();
+        if (!forceRefresh && Provisioner.cachedAgyConfigured && now - Provisioner.cachedAgyConfigured.timestamp < 30000) {
+            return Provisioner.cachedAgyConfigured.configured;
+        }
         const homeDir = os.homedir();
         const serverDirs = [
             path.join(homeDir, '.ag-wormhole'),
@@ -59,6 +75,7 @@ export class Provisioner {
             const stateFile = path.join(dir, '.wormhole-state.json');
             try {
                 await fs.access(stateFile);
+                Provisioner.cachedAgyConfigured = { configured: true, timestamp: now };
                 return true;
             } catch {
                 // Continue checking
@@ -69,68 +86,99 @@ export class Provisioner {
         try {
             await fs.access(agyBinary);
             if (process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.https_proxy) {
+                Provisioner.cachedAgyConfigured = { configured: true, timestamp: now };
                 return true;
             }
         } catch {
             // AGY binary not found
         }
 
+        Provisioner.cachedAgyConfigured = { configured: false, timestamp: now };
         return false;
     }
 
     /**
-     * Inspect active Language Server / AGY runtime process state and proxy status
+     * Inspect active Language Server / AGY runtime process state and proxy status.
+     * Uses zero-fork /proc/<pid> liveness verification on cached PIDs to avoid spawning
+     * shell/ps subprocesses on periodic status refreshes.
      */
-    public static async getLanguageServerProcess(): Promise<LanguageServerProcessInfo | null> {
+    public static async getLanguageServerProcess(forceRefresh: boolean = false): Promise<LanguageServerProcessInfo | null> {
+        const now = Date.now();
+        if (
+            !forceRefresh &&
+            Provisioner.cachedLsInfo &&
+            Provisioner.cachedLsInfo.info.isUsingProxy &&
+            now - Provisioner.cachedLsInfo.timestamp < 60000
+        ) {
+            try {
+                await fs.access(`/proc/${Provisioner.cachedLsInfo.info.pid}`);
+                return Provisioner.cachedLsInfo.info;
+            } catch {
+                Provisioner.cachedLsInfo = null;
+            }
+        }
+
         try {
-            const { stdout } = await execAsync('ps auxww | grep language_server_linux | grep -v grep');
-            const lines = stdout.trim().split('\n').filter(l => l.length > 0);
+            const { stdout } = await execFileAsync('ps', ['-eo', 'pid=,ppid=,args='], {
+                timeout: 3000,
+                maxBuffer: 512 * 1024
+            });
+            const lines = stdout.split('\n');
+            let hasMgraftcpProcess = false;
+            const legacyCandidates: LanguageServerProcessInfo[] = [];
+            const agyCandidates: Array<{ pid: number; ppid: number }> = [];
 
-            const hasMgraftcpWrapper = lines.some(line => line.includes('mgraftcp')) || await Provisioner.isMgraftcpRunning();
-
-            for (const line of lines) {
+            for (const rawLine of lines) {
+                const line = rawLine.trim();
+                if (!line) {
+                    continue;
+                }
                 if (line.includes('mgraftcp-fakedns')) {
+                    hasMgraftcpProcess = true;
                     continue;
                 }
                 if (line.includes('language_server_linux')) {
-                    const parts = line.split(/\s+/);
-                    if (parts.length >= 2) {
-                        const pid = parseInt(parts[1], 10);
-                        const isPersistent = line.includes('--persistent_mode') || line.includes('persistent_mode');
-                        const isBakBinary = line.includes('.bak');
-                        if (!isNaN(pid)) {
-                            return {
+                    const match = /^(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+                    if (match) {
+                        const pid = parseInt(match[1], 10);
+                        const cmd = match[3];
+                        const isPersistent = cmd.includes('--persistent_mode') || cmd.includes('persistent_mode');
+                        const isBakBinary = cmd.includes('.bak') || cmd.includes('mgraftcp');
+                        if (!isNaN(pid) && pid > 0) {
+                            legacyCandidates.push({
                                 pid,
                                 isPersistent,
-                                isUsingProxy: hasMgraftcpWrapper || isBakBinary
-                            };
+                                isUsingProxy: isBakBinary
+                            });
+                        }
+                    }
+                } else if (line.includes('/.gemini/bin/agy') || line.includes('agy --hub')) {
+                    const match = /^(\d+)\s+(\d+)\s+/.exec(line);
+                    if (match) {
+                        const pid = parseInt(match[1], 10);
+                        const ppid = parseInt(match[2], 10);
+                        if (!isNaN(pid) && pid > 0 && !isNaN(ppid)) {
+                            agyCandidates.push({ pid, ppid });
                         }
                     }
                 }
             }
-        } catch {
-            // Legacy process not found, check modern AGY runtime next
-        }
 
-        // Modern Antigravity 2.6+ AGY Hub Runtime (~/.gemini/bin/agy --hub)
-        try {
-            const { stdout } = await execAsync('ps -eo pid=,ppid=,args= 2>/dev/null | grep -E "/\\.gemini/bin/agy|agy --hub" | grep -v grep || true');
-            const lines = stdout.trim().split('\n').filter(l => l.trim().length > 0);
-            const candidates: Array<{ pid: number; ppid: number }> = [];
-            for (const line of lines) {
-                const parts = line.trim().split(/\s+/);
-                if (parts.length >= 3) {
-                    const pid = parseInt(parts[0], 10);
-                    const ppid = parseInt(parts[1], 10);
-                    if (!isNaN(pid) && pid > 0 && !isNaN(ppid)) {
-                        candidates.push({ pid, ppid });
-                    }
-                }
+            Provisioner.cachedMgraftcpRunning = { running: hasMgraftcpProcess, timestamp: now };
+
+            if (legacyCandidates.length > 0) {
+                const info: LanguageServerProcessInfo = {
+                    pid: legacyCandidates[0].pid,
+                    isPersistent: legacyCandidates[0].isPersistent,
+                    isUsingProxy: legacyCandidates[0].isUsingProxy || hasMgraftcpProcess
+                };
+                Provisioner.cachedLsInfo = { info, timestamp: now };
+                return info;
             }
 
             // Prioritize the agy process owned by the current Extension Host (ppid === process.pid),
             // followed by active parented sessions (ppid > 1), and lastly orphaned ppid === 1 processes.
-            candidates.sort((a, b) => {
+            agyCandidates.sort((a, b) => {
                 const rank = (c: { pid: number; ppid: number }): number => {
                     if (c.ppid === process.pid) {
                         return 0;
@@ -143,8 +191,8 @@ export class Provisioner {
                 return rank(a) - rank(b) || b.pid - a.pid;
             });
 
-            if (candidates.length > 0) {
-                const chosen = candidates[0];
+            if (agyCandidates.length > 0) {
+                const chosen = agyCandidates[0];
                 let envReadable = false;
                 let hasProxyEnv = false;
                 try {
@@ -155,16 +203,19 @@ export class Provisioner {
                     // Fallback when /proc/<pid>/environ is restricted
                 }
                 const stateConfigured = await Provisioner.isAgyRuntimeConfigured();
-                return {
+                const info: LanguageServerProcessInfo = {
                     pid: chosen.pid,
                     isPersistent: false,
                     isUsingProxy: envReadable ? hasProxyEnv : stateConfigured
                 };
+                Provisioner.cachedLsInfo = { info, timestamp: now };
+                return info;
             }
         } catch {
-            // AGY process not running
+            // Process scan failed or unsupported platform
         }
 
+        Provisioner.cachedLsInfo = null;
         return null;
     }
 
@@ -785,6 +836,58 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
     }
 
     /**
+     * Reap orphaned PPid=1 runtime processes (e.g. orphaned `agy --hub`, `mgraftcp-fakedns`, or hung `notify-send`)
+     * whose parent Extension Host or wrapper has already exited, preventing memory leaks and zombie accumulation.
+     */
+    public static async reapOrphanProcesses(): Promise<number[]> {
+        if (process.platform !== 'linux') {
+            return [];
+        }
+        const reaped: number[] = [];
+        try {
+            const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+            const args = uid !== undefined
+                ? ['-u', String(uid), '-o', 'pid=,ppid=,args=']
+                : ['-eo', 'pid=,ppid=,args='];
+            const { stdout } = await execFileAsync('ps', args, { timeout: 3000, maxBuffer: 512 * 1024 });
+            for (const rawLine of stdout.split('\n')) {
+                const line = rawLine.trim();
+                if (!line) {
+                    continue;
+                }
+                const match = /^(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+                if (!match) {
+                    continue;
+                }
+                const pid = parseInt(match[1], 10);
+                const ppid = parseInt(match[2], 10);
+                const cmd = match[3];
+                if (isNaN(pid) || pid <= 1 || ppid !== 1 || pid === process.pid) {
+                    continue;
+                }
+                if (
+                    (/\/\.gemini\/bin\/agy\b/.test(cmd) && cmd.includes('--hub')) ||
+                    cmd.includes('mgraftcp-fakedns') ||
+                    cmd.includes('notify-send --wait --app-name=Antigravity')
+                ) {
+                    try {
+                        process.kill(pid, 'SIGKILL');
+                        reaped.push(pid);
+                    } catch {
+                        // Ignore EPERM/ESRCH
+                    }
+                }
+            }
+            if (reaped.length > 0) {
+                logger.log(`Reaped ${reaped.length} orphaned PPid=1 runtime process(es): ${reaped.join(', ')}`, false);
+            }
+        } catch {
+            // Ignore process scan errors
+        }
+        return reaped;
+    }
+
+    /**
      * Purge residual caches, temporary wrapper artifacts, and orphaned states across remote workspaces
      */
     public static async purgeStaleCaches(): Promise<{ success: boolean; message: string }> {
@@ -809,11 +912,11 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 }
             }
 
-            // 3. Terminate any orphaned mgraftcp processes and orphaned PPID=1 agy --hub / notify-send processes
-            await execAsync('pkill -f "[m]graftcp-fakedns" 2>/dev/null || true');
-            await execAsync(
-                'ps -u $(id -u) -o pid=,ppid=,args= 2>/dev/null | awk \'$2 == 1 && (/\\/\\.gemini\\/bin\\/agy.*--hub/ || /notify-send --wait --app-name=Antigravity/) {print $1}\' | xargs -r kill -9 2>/dev/null || true'
-            );
+            // 3. Reap orphaned PPID=1 runtime processes (agy --hub, mgraftcp-fakedns, notify-send)
+            await Provisioner.reapOrphanProcesses();
+            Provisioner.cachedLsInfo = null;
+            Provisioner.cachedMgraftcpRunning = null;
+            Provisioner.cachedAgyConfigured = null;
 
             logger.log('Purged stale remote wormhole caches and temporary files.', false);
             return { success: true, message: 'Remote stale caches and orphaned processes purged.' };

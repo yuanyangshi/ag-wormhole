@@ -59,12 +59,19 @@ export class TrafficCollector {
     }
 
     public onUpdate(callback: StatsUpdateCallback): { dispose(): void } {
+        const wasEmpty = this.updateCallbacks.length === 0;
         this.updateCallbacks.push(callback);
+        if (wasEmpty && isRunningRemotely()) {
+            this.start();
+        }
         return {
             dispose: () => {
                 const index = this.updateCallbacks.indexOf(callback);
                 if (index >= 0) {
                     this.updateCallbacks.splice(index, 1);
+                }
+                if (this.updateCallbacks.length === 0) {
+                    this.stop();
                 }
             }
         };

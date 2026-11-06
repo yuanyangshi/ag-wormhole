@@ -119,7 +119,7 @@ export class StatusPanel {
             column || vscode.ViewColumn.One,
             {
                 enableScripts: true,
-                retainContextWhenHidden: true
+                retainContextWhenHidden: false
             }
         );
 

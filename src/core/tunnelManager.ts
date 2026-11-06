@@ -4,7 +4,7 @@
  */
 
 import * as net from 'net';
-import { exec, spawn } from 'child_process';
+import { exec, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { SSHConfigManager } from './sshConfigManager';
 import { logger } from '../shared/logger';
@@ -21,6 +21,9 @@ const execAsync = promisify(exec);
 
 export class TunnelManager {
     private static isSyncingKeepers = false;
+    private static lastKeeperSyncMs = 0;
+    private static localUnreachableWarned = false;
+    private static activeKeeperChildren = new Map<string, ChildProcess>();
     /**
      * Test TCP connectivity to specified endpoint
      */
@@ -182,7 +185,7 @@ export class TunnelManager {
     /**
      * Synchronize local SSH port forwarding according to VS Code configuration
      */
-    public static async syncLocalForwarding(): Promise<{ enabled: boolean; localPort: number; remotePort: number }> {
+    public static async syncLocalForwarding(silent: boolean = false): Promise<{ enabled: boolean; localPort: number; remotePort: number }> {
         let enabled = true;
         let localPort = DEFAULT_PROXY_PORT;
         let remotePort = DEFAULT_PROXY_PORT;
@@ -216,19 +219,25 @@ export class TunnelManager {
         if (enabled) {
             const isLocalReachable = await TunnelManager.checkPortAvailable('127.0.0.1', effectiveLocalPort);
             if (!isLocalReachable) {
-                try {
-                    const vscode = require('vscode');
-                    vscode.window.showWarningMessage(
-                        `[AG-Wormhole] Local proxy listener at 127.0.0.1:${effectiveLocalPort} is unreachable. Please verify your local proxy gateway is started.`
-                    );
-                } catch {
-                    // Non-VS Code environment
+                if (!silent && !TunnelManager.localUnreachableWarned) {
+                    TunnelManager.localUnreachableWarned = true;
+                    try {
+                        const vscode = require('vscode');
+                        vscode.window.showWarningMessage(
+                            `[AG-Wormhole] Local proxy listener at 127.0.0.1:${effectiveLocalPort} is unreachable. Please verify your local proxy gateway is started.`
+                        );
+                    } catch {
+                        // Non-VS Code environment
+                    }
                 }
-            } else if (isRunningLocally()) {
-                await TunnelManager.ensureBackgroundTunnelKeepers(effectiveLocalPort, remotePort, true);
+            } else {
+                TunnelManager.localUnreachableWarned = false;
+                if (isRunningLocally()) {
+                    await TunnelManager.ensureBackgroundTunnelKeepers(effectiveLocalPort, remotePort, true, true);
+                }
             }
         } else if (isRunningLocally()) {
-            await TunnelManager.ensureBackgroundTunnelKeepers(effectiveLocalPort, remotePort, false);
+            await TunnelManager.ensureBackgroundTunnelKeepers(effectiveLocalPort, remotePort, false, true);
         }
 
         return { enabled, localPort: effectiveLocalPort, remotePort };
@@ -396,17 +405,32 @@ export class TunnelManager {
     public static async ensureBackgroundTunnelKeepers(
         localPort: number,
         remotePort: number,
-        enabled: boolean = true
+        enabled: boolean = true,
+        force: boolean = false
     ): Promise<void> {
         if (TunnelManager.isSyncingKeepers) {
             return;
         }
+        const now = Date.now();
+        // Fast-path: if we already have live in-memory tracked keeper child process(es),
+        // avoid spawning PowerShell/ps unless 5 minutes have elapsed or force=true.
+        const hasLiveTrackedKeepers =
+            TunnelManager.activeKeeperChildren.size > 0 &&
+            Array.from(TunnelManager.activeKeeperChildren.values()).every(
+                (c) => c.exitCode === null && !c.killed
+            );
+        const minIntervalMs = hasLiveTrackedKeepers ? 300000 : 120000;
+        if (!force && enabled && now - TunnelManager.lastKeeperSyncMs < minIntervalMs) {
+            return;
+        }
         TunnelManager.isSyncingKeepers = true;
+        TunnelManager.lastKeeperSyncMs = now;
 
         try {
             const { interactiveHosts, keeperPidsByHost } = await TunnelManager.discoverActiveSshSessions();
 
             if (!enabled) {
+                await TunnelManager.stopAllKeepers();
                 for (const pids of keeperPidsByHost.values()) {
                     for (const pid of pids) {
                         await TunnelManager.terminateKeeperProcess(pid);
@@ -418,9 +442,24 @@ export class TunnelManager {
             // Terminate keeper processes for hosts that no longer have any active interactive Remote-SSH session
             for (const [host, pids] of keeperPidsByHost.entries()) {
                 if (!interactiveHosts.includes(host)) {
+                    const tracked = TunnelManager.activeKeeperChildren.get(host);
+                    if (tracked) {
+                        try {
+                            tracked.kill();
+                        } catch {
+                            // Ignore
+                        }
+                        TunnelManager.activeKeeperChildren.delete(host);
+                    }
                     for (const pid of pids) {
                         await TunnelManager.terminateKeeperProcess(pid);
                         logger.log(`Terminated idle background tunnel keeper (PID ${pid}) for disconnected host '${host}'`, true);
+                    }
+                } else if (pids.length > 1) {
+                    // Deduplicate redundant keeper processes for the same host to prevent memory/zombie accumulation
+                    for (const extraPid of pids.slice(1)) {
+                        await TunnelManager.terminateKeeperProcess(extraPid);
+                        logger.log(`Terminated duplicate background tunnel keeper (PID ${extraPid}) for host '${host}'`, true);
                     }
                 }
             }
@@ -436,17 +475,12 @@ export class TunnelManager {
 
             for (const host of interactiveHosts) {
                 const existingKeepers = keeperPidsByHost.get(host) || [];
-                if (existingKeepers.length > 0) {
+                const trackedChild = TunnelManager.activeKeeperChildren.get(host);
+                if (existingKeepers.length > 0 || (trackedChild && trackedChild.exitCode === null && !trackedChild.killed)) {
                     continue;
                 }
 
                 try {
-                    // Secondary quick check before spawning to guard against multi-window concurrency
-                    const freshSessions = await TunnelManager.discoverActiveSshSessions();
-                    if ((freshSessions.keeperPidsByHost.get(host) || []).length > 0) {
-                        continue;
-                    }
-
                     const mainConfig = SSHConfigManager.getMainConfigPath();
                     const sshDir = SSHConfigManager.getSSHDir();
                     let configParam: string[] = [];
@@ -485,27 +519,25 @@ export class TunnelManager {
                         host
                     ];
 
-                    if (process.platform === 'win32') {
-                        const escapedArgs = args.map(a => (a.includes(' ') && !a.startsWith('"')) ? `\\"${a}\\"` : a);
-                        const cmdStr = `ssh.exe ${escapedArgs.join(' ')}`;
-                        const wmiCmd = [
-                            'powershell -NoProfile -NonInteractive -Command "',
-                            '$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }; ',
-                            `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${cmdStr}'; ProcessStartupInformation = $si } | Out-Null`,
-                            '"'
-                        ].join('');
-                        await execAsync(wmiCmd, { timeout: 4000, windowsHide: true });
-                    } else {
-                        const child = spawn('ssh', args, {
-                            detached: true,
-                            stdio: 'ignore',
-                            windowsHide: true
-                        });
-                        child.on('error', () => {
-                            // Ignore spawn errors if ssh binary is missing
-                        });
-                        child.unref();
-                    }
+                    // On Windows, use detached: false + windowsHide: true so CreateProcessW sets CREATE_NO_WINDOW
+                    // rather than DETACHED_PROCESS. This prevents child processes (such as `Match ... exec "cmd.exe ..."`
+                    // in ~/.ssh/config) from allocating a visible console window on the desktop.
+                    const sshExe = process.platform === 'win32' ? 'ssh.exe' : 'ssh';
+                    const child = spawn(sshExe, args, {
+                        detached: process.platform !== 'win32',
+                        stdio: 'ignore',
+                        windowsHide: true
+                    });
+                    TunnelManager.activeKeeperChildren.set(host, child);
+                    const cleanupChild = () => {
+                        if (TunnelManager.activeKeeperChildren.get(host) === child) {
+                            TunnelManager.activeKeeperChildren.delete(host);
+                        }
+                        child.removeAllListeners();
+                    };
+                    child.once('exit', cleanupChild);
+                    child.once('error', cleanupChild);
+                    child.unref();
 
                     logger.log(
                         `Spawned autonomous HA tunnel keeper for remote host '${host}' (ports ${remotePort}, ${remotePort + 3} -> 127.0.0.1:${localPort})`,
@@ -517,6 +549,23 @@ export class TunnelManager {
             }
         } finally {
             TunnelManager.isSyncingKeepers = false;
+        }
+    }
+
+    /**
+     * Cleanly terminate all in-memory tracked keeper child processes on shutdown
+     */
+    public static async stopAllKeepers(): Promise<void> {
+        for (const [host, child] of TunnelManager.activeKeeperChildren.entries()) {
+            try {
+                child.removeAllListeners();
+                if (child.pid && child.exitCode === null && !child.killed) {
+                    child.kill();
+                }
+            } catch {
+                // Ignore termination error
+            }
+            TunnelManager.activeKeeperChildren.delete(host);
         }
     }
 
@@ -534,6 +583,8 @@ export class TunnelManager {
             } catch {
                 // Ignore missing file
             }
+
+            await TunnelManager.stopAllKeepers();
 
             // Recycle existing keeper processes
             const { keeperPidsByHost } = await TunnelManager.discoverActiveSshSessions();

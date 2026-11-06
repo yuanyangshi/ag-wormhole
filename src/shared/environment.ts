@@ -14,6 +14,11 @@ export function isRunningLocally(): boolean {
     if (mockIsRemote !== undefined) {
         return !mockIsRemote;
     }
+    // The remote data plane only runs on Linux. Any Extension Host executing on Windows or macOS
+    // is always on the local client machine, even when attached to a Remote-SSH window.
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+        return true;
+    }
     try {
         const vscode = require('vscode');
         return !vscode.env.remoteName;
@@ -25,6 +30,9 @@ export function isRunningLocally(): boolean {
 export function isRunningRemotely(): boolean {
     if (mockIsRemote !== undefined) {
         return mockIsRemote;
+    }
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+        return false;
     }
     try {
         const vscode = require('vscode');

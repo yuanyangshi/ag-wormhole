@@ -417,12 +417,11 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
         })
     );
 
-    // Auto-setup silently
+    // Auto-setup silently (trafficCollector starts on-demand only when Dashboard panel is opened)
     await Provisioner.runSetupSilently(remoteHost, remotePort, proxyType, extensionPath);
-    trafficCollector.start();
 
     // Check startup status (after watchdog probe has had a chance to bridge fallback ports if needed)
-    const showStartupNotification = config.get<boolean>(CFG_SHOW_STATUS_ON_STARTUP, true);
+    const showStartupNotification = config.get<boolean>(CFG_SHOW_STATUS_ON_STARTUP, false);
     if (showStartupNotification) {
         setTimeout(async () => {
             const metrics = await TunnelWatchdog.getInstance().probe();
@@ -449,6 +448,9 @@ export async function deactivate(): Promise<void> {
         clearInterval(autoRefreshTimer);
     }
     TunnelWatchdog.getInstance().stop();
+    if (isRunningLocally()) {
+        await TunnelManager.stopAllKeepers();
+    }
     await IngressRelay.getInstance().stopRelay();
     trafficCollector?.stop();
     logger.log('AG-Wormhole deactivated.', isRunningLocally());

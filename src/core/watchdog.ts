@@ -315,16 +315,16 @@ export class TunnelWatchdog {
                     } catch {
                         // Ignore keeper check error in standalone test context
                     }
+                } else if (this.probeCount % 30 === 15) {
+                    // Periodically reap any orphaned PPid=1 runtime processes (e.g. agy --hub from closed windows)
+                    Provisioner.reapOrphanProcesses().catch(() => {});
                 }
 
                 if (wasDisconnected && isRunningLocally()) {
-                    // Auto-sync when local gateway is brought back online
+                    // Auto-sync silently when local gateway is brought back online (no intrusive popup)
                     try {
-                        await TunnelManager.syncLocalForwarding();
-                        const vscode = require('vscode');
-                        vscode.window.showInformationMessage(
-                            `[AG-Wormhole] Local proxy listener at 127.0.0.1:${localPort} recovered! Tunnel synchronized.`
-                        );
+                        await TunnelManager.syncLocalForwarding(true);
+                        logger.log(`Local proxy listener at 127.0.0.1:${localPort} recovered; tunnel synchronized.`, true);
                     } catch {
                         // Non-extension environment
                     }
@@ -430,12 +430,16 @@ export class TunnelWatchdog {
                 }
             }
         } else {
-            // In local environment, attempt auto-sync of SSH config
-            this.metrics.lastRecoveryAttempt = new Date();
-            try {
-                await TunnelManager.syncLocalForwarding();
-            } catch (err) {
-                logger.log(`Tunnel Watchdog auto-sync failed: ${err}`, true);
+            // In local environment, attempt silent auto-sync of SSH config (respecting cooldown)
+            const now = Date.now();
+            const lastAttemptMs = this.metrics.lastRecoveryAttempt?.getTime() ?? 0;
+            if (now - lastAttemptMs >= this.reclaimCooldownMs) {
+                this.metrics.lastRecoveryAttempt = new Date();
+                try {
+                    await TunnelManager.syncLocalForwarding(true);
+                } catch (err) {
+                    logger.log(`Tunnel Watchdog auto-sync failed: ${err}`, true);
+                }
             }
         }
     }

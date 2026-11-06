@@ -112,7 +112,7 @@
         },
         "ag-wormhole.showStatusOnStartup": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "scope": "machine-overridable",
           "description": "Show a status notification when connecting to a remote server."
         },

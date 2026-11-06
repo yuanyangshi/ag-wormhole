@@ -319,7 +319,8 @@ export class IngressRelay {
                             graceTimer = null;
                         }
                         clearResponseTimer();
-                        targetSocket.setTimeout(0);
+                        targetSocket.setTimeout(300000);
+                        clientSocket.setTimeout(300000);
                         if (!isConnectedToCandidate && clientPreBuffer.length > 0) {
                             try {
                                 targetSocket.write(Buffer.concat(clientPreBuffer));
@@ -419,6 +420,11 @@ export class IngressRelay {
                     targetSocket.on('timeout', () => {
                         if (!isPiped) {
                             onCandidateFail();
+                        } else {
+                            targetSocket.destroy();
+                            if (!clientSocket.destroyed) {
+                                clientSocket.destroy();
+                            }
                         }
                     });
                     targetSocket.on('error', onCandidateFail);
@@ -438,18 +444,21 @@ export class IngressRelay {
                     });
                 };
 
-                clientSocket.on('error', () => {
+                const cleanupClient = () => {
                     clearResponseTimer();
+                    clientPreBuffer.length = 0;
                     if (activeTargetSocket && !activeTargetSocket.destroyed) {
                         activeTargetSocket.destroy();
                     }
-                });
-                clientSocket.on('close', () => {
-                    clearResponseTimer();
-                    if (activeTargetSocket && !activeTargetSocket.destroyed) {
-                        activeTargetSocket.destroy();
+                };
+                clientSocket.on('timeout', () => {
+                    cleanupClient();
+                    if (!clientSocket.destroyed) {
+                        clientSocket.destroy();
                     }
                 });
+                clientSocket.on('error', cleanupClient);
+                clientSocket.on('close', cleanupClient);
 
                 tryHuntAndConnect(0);
             });
