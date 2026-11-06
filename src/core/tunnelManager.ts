@@ -354,6 +354,29 @@ export class TunnelManager {
     }
 
     /**
+     * Strip wormhole includes and conflicting forwarding directives from a raw SSH config
+     * so the dedicated background keeper process only binds its assigned keeper port (remotePort + 3).
+     */
+    public static sanitizeKeeperSshConfig(rawConfig: string): string {
+        return rawConfig
+            .split(/\r?\n/)
+            .filter((line: string) => {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith('#')) {
+                    return true;
+                }
+                if (line.includes('config.wormhole')) {
+                    return false;
+                }
+                if (/^(RemoteForward|ClearAllForwardings|ExitOnForwardFailure)\b/i.test(trimmed)) {
+                    return false;
+                }
+                return true;
+            })
+            .join('\n');
+    }
+
+    /**
      * Maintain detached background SSH reverse tunnel keepers for active remote hosts.
      * Prevents tunnel starvation when multiple Remote-SSH windows are open and the primary window closes
      * or switches to a local workspace.
@@ -420,13 +443,11 @@ export class TunnelManager {
                         const path = require('path');
                         if (fs.existsSync(mainConfig)) {
                             // Build a dedicated keeper SSH config without 'Include config.wormhole'
+                            // or any user-hardcoded RemoteForward/ExitOnForwardFailure directives,
                             // so the background keeper ONLY binds remotePort+3 (with ExitOnForwardFailure=yes)
-                            // and never steals fallback ports (remotePort+1, remotePort+2) from interactive reconnects.
+                            // and never collides with primary/fallback ports (remotePort..remotePort+2).
                             const rawMain = fs.readFileSync(mainConfig, 'utf-8') as string;
-                            const keeperCfgContent = rawMain
-                                .split(/\r?\n/)
-                                .filter((line: string) => !line.includes('config.wormhole'))
-                                .join('\n');
+                            const keeperCfgContent = TunnelManager.sanitizeKeeperSshConfig(rawMain);
                             const keeperCfgPath = path.join(sshDir, 'config.wormhole.keeper');
                             fs.writeFileSync(keeperCfgPath, keeperCfgContent, 'utf-8');
                             configParam = ['-F', keeperCfgPath];

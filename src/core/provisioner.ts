@@ -320,6 +320,100 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
     }
 
     /**
+     * Check whether a local TCP port is actively in LISTEN state even when the kernel
+     * hides the owning PID (e.g. non-root inspection of setuid/non-dumpable sshd workers).
+     */
+    public static async isPortListeningUnprivileged(port: number): Promise<boolean> {
+        if (!port || port <= 0 || port > 65535) {
+            return false;
+        }
+        try {
+            const { stdout } = await execAsync(`ss -ltn "sport = :${port}" 2>/dev/null || true`);
+            if (/\bLISTEN\b/.test(stdout)) {
+                return true;
+            }
+        } catch {
+            // Ignore ss failure
+        }
+        return false;
+    }
+
+    /**
+     * Pure helper: sum the Send-Q column of `ss -tn` output rows in ESTABLISHED state.
+     * A large persistent Send-Q on SSH connections indicates a dead peer (zombie session).
+     */
+    public static parseStuckSendQueueBytes(ssOutput: string): number {
+        let total = 0;
+        for (const line of ssOutput.split(/\r?\n/)) {
+            const cols = line.trim().split(/\s+/);
+            // Expected: State Recv-Q Send-Q Local Peer
+            if (cols.length >= 5 && cols[0] === 'ESTAB') {
+                const sendQ = parseInt(cols[2], 10);
+                if (!isNaN(sendQ) && sendQ > 0) {
+                    total += sendQ;
+                }
+            }
+        }
+        return total;
+    }
+
+    /**
+     * Diagnostic: total bytes queued on ESTABLISHED sshd connections (port 22) that the peer is not draining.
+     */
+    public static async getStuckSendQueueBytes(): Promise<number> {
+        try {
+            const { stdout } = await execAsync('ss -tn "( sport = :22 )" 2>/dev/null || true');
+            return Provisioner.parseStuckSendQueueBytes(stdout);
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * Enumerate all sshd processes owned by the current unprivileged user.
+     */
+    public static async getUnprivilegedUserSshdPids(): Promise<number[]> {
+        try {
+            const { stdout } = await execAsync('pgrep -u $(id -u) sshd 2>/dev/null || true');
+            return Array.from(new Set(
+                stdout.trim().split(/\s+/).map(p => parseInt(p, 10)).filter(p => !isNaN(p) && p > 0)
+            ));
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * Pure helper to determine whether a candidate interactive sshd session (with start time `candidateStart`)
+     * has been superseded by a newer persistent interactive sshd session (excluding transient `bash -c` commands).
+     * Returns the superseding PID if superseded, or null if the candidate is still the active session.
+     */
+    public static findSupersedingSshdPid(
+        candidateStart: number,
+        otherSessions: Array<{ pid: number; startTicks: number; childArgs: string }>
+    ): number | null {
+        for (const other of otherSessions) {
+            if (other.startTicks <= candidateStart) {
+                continue;
+            }
+            const lines = other.childArgs
+                .split(/\r?\n/)
+                .map(l => l.trim())
+                .filter(Boolean);
+            if (lines.length === 0) {
+                continue;
+            }
+            // Ignore transient one-off commands (e.g. `bash -c ...` or `sh -c ...`) so ad-hoc CLI
+            // invocations never cause the persistent Remote-SSH session (`bash -s`) to be reclaimed.
+            const hasPersistentChild = lines.some(line => !/\s-c(\s|$)/.test(line));
+            if (hasPersistentChild) {
+                return other.pid;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Collect all ancestor PIDs of the current Extension Host up to PID 1
      * to prevent terminating the active SSH daemon or remote IDE server tree.
      */
@@ -383,6 +477,30 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 for (const pid of keeperPids) {
                     protectedPids.add(pid);
                 }
+                // Under unprivileged Linux accounts, `ss -lptn` hides `sshd` PIDs.
+                // Protect the newest childless `sshd` (the active `ssh -N` background keeper).
+                if (keeperPids.length === 0) {
+                    const userSshdPids = await Provisioner.getUnprivilegedUserSshdPids();
+                    let newestKeeperPid: number | null = null;
+                    let newestKeeperStart = -1;
+                    for (const sshdPid of userSshdPids) {
+                        try {
+                            const { stdout: childrenOut } = await execAsync(`pgrep -P ${sshdPid} 2>/dev/null || true`);
+                            if (childrenOut.trim().length === 0) {
+                                const startTicks = await Provisioner.getProcessStartTimeTicks(sshdPid);
+                                if (startTicks !== null && startTicks > newestKeeperStart) {
+                                    newestKeeperStart = startTicks;
+                                    newestKeeperPid = sshdPid;
+                                }
+                            }
+                        } catch {
+                            // Ignore individual process inspection error
+                        }
+                    }
+                    if (newestKeeperPid !== null) {
+                        protectedPids.add(newestKeeperPid);
+                    }
+                }
             }
         }
 
@@ -435,9 +553,9 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             }
 
             // If it is an sshd process:
-            // 1. An sshd with zero child processes is an orphaned tunnel session -> safe to reclaim.
+            // 1. An sshd with zero child processes (not in protectedPids) is an orphaned tunnel session -> safe to reclaim.
             // 2. In Remote-SSH ("bash -s"), a dead disconnected sshd may still have an old shell child
-            //    until TCP keepalive expires; if a newer interactive sshd session for the same user
+            //    until TCP keepalive expires; if a newer persistent interactive sshd session for the same user
             //    already exists, this older sshd holding a dead proxy port is a superseded zombie session.
             if (cmdLine.includes('sshd')) {
                 const { stdout: childrenOut } = await execAsync(`pgrep -P ${pid} 2>/dev/null || true`);
@@ -447,25 +565,31 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
 
                 const candidateStart = await Provisioner.getProcessStartTimeTicks(pid);
                 if (candidateStart !== null) {
-                    const { stdout: userSshdOut } = await execAsync('pgrep -u $(id -u) sshd 2>/dev/null || true');
-                    const otherPids = userSshdOut
-                        .trim()
-                        .split(/\s+/)
-                        .map((s) => parseInt(s, 10))
-                        .filter((p) => !isNaN(p) && p > 0 && p !== pid);
+                    const otherPids = (await Provisioner.getUnprivilegedUserSshdPids()).filter(p => p !== pid);
+                    const otherSessions: Array<{ pid: number; startTicks: number; childArgs: string }> = [];
 
                     for (const otherPid of otherPids) {
                         const { stdout: otherChildren } = await execAsync(`pgrep -P ${otherPid} 2>/dev/null || true`);
                         if (otherChildren.trim().length > 0) {
                             const otherStart = await Provisioner.getProcessStartTimeTicks(otherPid);
                             if (otherStart !== null && otherStart > candidateStart) {
-                                logger.log(
-                                    `Identified superseded stale sshd session (PID ${pid}, older than active sshd PID ${otherPid}) for reclamation`,
-                                    false
-                                );
-                                return true;
+                                const { stdout: childArgs } = await execAsync(`ps --ppid ${otherPid} -o args= 2>/dev/null || true`);
+                                otherSessions.push({
+                                    pid: otherPid,
+                                    startTicks: otherStart,
+                                    childArgs
+                                });
                             }
                         }
+                    }
+
+                    const supersedingPid = Provisioner.findSupersedingSshdPid(candidateStart, otherSessions);
+                    if (supersedingPid !== null) {
+                        logger.log(
+                            `Identified superseded stale sshd session (PID ${pid}, older than active sshd PID ${supersedingPid}) for reclamation`,
+                            false
+                        );
+                        return true;
                     }
                 }
 
@@ -489,7 +613,12 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
 
         const pidsKilled: number[] = [];
         try {
-            const pids = await Provisioner.getListeningPids(port);
+            let pids = await Provisioner.getListeningPids(port);
+            // Under unprivileged Linux accounts, `lsof` and `ss -lptn` hide the PID of setuid-dropped `sshd`
+            // workers even when the port is actively bound in LISTEN state by a zombie `sshd` session.
+            if (pids.length === 0 && await Provisioner.isPortListeningUnprivileged(port)) {
+                pids = await Provisioner.getUnprivilegedUserSshdPids();
+            }
             if (pids.length === 0) {
                 return { success: true, message: `No active process holding port ${port}`, pidsKilled: [] };
             }
@@ -522,6 +651,20 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
 
             if (pidsKilled.length > 0) {
                 logger.log(`Port ${port} reclaimed. Terminated zombie PIDs: ${pidsKilled.join(', ')}`, false);
+                // Verify the kernel actually released the listener; the kernel may take a moment to tear down sockets.
+                let stillListening = true;
+                for (let i = 0; i < 10 && stillListening; i++) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                    stillListening = await Provisioner.isPortListeningUnprivileged(port);
+                }
+                if (stillListening) {
+                    const backlog = await Provisioner.getStuckSendQueueBytes();
+                    logger.log(
+                        `Port ${port} is still in LISTEN state after reclaiming PIDs ${pidsKilled.join(', ')}` +
+                        (backlog > 0 ? ` (stuck ESTABLISHED Send-Q backlog: ${backlog} bytes)` : ''),
+                        false
+                    );
+                }
             }
             return {
                 success: true,

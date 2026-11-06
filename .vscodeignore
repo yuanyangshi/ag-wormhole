@@ -12,6 +12,8 @@ esbuild.js
 **/*.map
 **/*.ts
 **/.vscode-test.*
+.agents/**
+AGENTS.md
 指南*.md
 !dist
 !dist/**

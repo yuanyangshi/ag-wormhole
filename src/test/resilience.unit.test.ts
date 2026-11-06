@@ -1,4 +1,4 @@
-import * as assert from 'assert';
+﻿import * as assert from 'assert';
 import * as net from 'net';
 import { TunnelManager } from '../core/tunnelManager';
 import { Provisioner } from '../core/provisioner';
@@ -424,6 +424,58 @@ suite('Resilience & Stability Unit Tests', () => {
 
         const invalidCmd = 'node --inspect=127.0.0.1:9229 extensionHostProcess.js';
         assert.strictEqual(TunnelManager.parseSshCommandDestination(invalidCmd), null);
+    });
+
+    test('TunnelManager.sanitizeKeeperSshConfig strips wormhole include and conflicting RemoteForward directives', () => {
+        const rawConfig = [
+            'Include config.wormhole',
+            'Match host remote-host,remote-host-alt exec "cmd.exe /c ping -n 1 -w 200 192.0.2.10 >nul 2>&1"',
+            '    HostName 192.0.2.10',
+            '',
+            'Host remote-host remote-host-alt',
+            '    HostName 192.0.2.20',
+            '    User remote-host',
+            '    ExitOnForwardFailure no',
+            '    RemoteForward 7890 127.0.0.1:7890'
+        ].join('\n');
+
+        const sanitized = TunnelManager.sanitizeKeeperSshConfig(rawConfig);
+        assert.strictEqual(sanitized.includes('config.wormhole'), false);
+        assert.strictEqual(sanitized.includes('RemoteForward'), false);
+        assert.strictEqual(sanitized.includes('ExitOnForwardFailure'), false);
+        assert.strictEqual(sanitized.includes('HostName 192.0.2.10'), true);
+        assert.strictEqual(sanitized.includes('HostName 192.0.2.20'), true);
+        assert.strictEqual(sanitized.includes('User remote-host'), true);
+    });
+
+    test('Provisioner.findSupersedingSshdPid identifies newer persistent Remote-SSH sessions while ignoring transient bash -c commands', () => {
+        // 1. Candidate (startTicks=1000) should NOT be superseded by a newer transient one-off CLI command (`bash -c ...`)
+        const transientOnly = [
+            { pid: 3001, startTicks: 2000, childArgs: 'bash -c ps -ef | grep sshd' }
+        ];
+        assert.strictEqual(Provisioner.findSupersedingSshdPid(1000, transientOnly), null);
+
+        // 2. Candidate (startTicks=1000) SHOULD be superseded by a newer persistent Remote-SSH session (`bash -s`)
+        const withPersistent = [
+            { pid: 3001, startTicks: 1500, childArgs: 'bash -c ls -la' },
+            { pid: 3002, startTicks: 1800, childArgs: 'bash -s' }
+        ];
+        assert.strictEqual(Provisioner.findSupersedingSshdPid(1000, withPersistent), 3002);
+
+        // 3. Active newest session (startTicks=2500) should NOT be superseded by older persistent sessions
+        assert.strictEqual(Provisioner.findSupersedingSshdPid(2500, withPersistent), null);
+    });
+
+    test('parseStuckSendQueueBytes sums Send-Q of ESTAB rows only', () => {
+        const out = [
+            'State  Recv-Q Send-Q Local Address:Port Peer Address:Port',
+            'ESTAB  0      138644 192.0.2.10:22 198.51.100.5:50001',
+            'ESTAB  0      0      192.0.2.10:22 198.51.100.5:50002',
+            'ESTAB  0      100    192.0.2.10:22 198.51.100.5:50003',
+            'LISTEN 0      4096   0.0.0.0:22 0.0.0.0:*'
+        ].join('\n');
+        assert.strictEqual(Provisioner.parseStuckSendQueueBytes(out), 138744);
+        assert.strictEqual(Provisioner.parseStuckSendQueueBytes(''), 0);
     });
 });
 
