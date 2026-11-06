@@ -51,7 +51,8 @@ export class Provisioner {
         const serverDirs = [
             path.join(homeDir, '.ag-wormhole'),
             path.join(homeDir, '.antigravity-ide-server'),
-            path.join(homeDir, '.antigravity-server')
+            path.join(homeDir, '.antigravity-server'),
+            path.join(homeDir, '.vscode-server')
         ];
 
         for (const dir of serverDirs) {
@@ -113,35 +114,52 @@ export class Provisioner {
 
         // Modern Antigravity 2.6+ AGY Hub Runtime (~/.gemini/bin/agy --hub)
         try {
-            const { stdout } = await execAsync('ps auxww | grep -E "/\\.gemini/bin/agy|agy --hub" | grep -v grep');
-            const lines = stdout.trim().split('\n').filter(l => l.length > 0);
+            const { stdout } = await execAsync('ps -eo pid=,ppid=,args= 2>/dev/null | grep -E "/\\.gemini/bin/agy|agy --hub" | grep -v grep || true');
+            const lines = stdout.trim().split('\n').filter(l => l.trim().length > 0);
+            const candidates: Array<{ pid: number; ppid: number }> = [];
             for (const line of lines) {
-                const parts = line.split(/\s+/);
-                if (parts.length >= 2) {
-                    const pid = parseInt(parts[1], 10);
-                    if (!isNaN(pid) && pid > 0) {
-                        let hasProxyEnv = Boolean(
-                            process.env.HTTP_PROXY ||
-                            process.env.HTTPS_PROXY ||
-                            process.env.http_proxy ||
-                            process.env.https_proxy
-                        );
-                        try {
-                            const envRaw = await fs.readFile(`/proc/${pid}/environ`, 'utf-8');
-                            if (/HTTP_PROXY=|HTTPS_PROXY=|http_proxy=|https_proxy=|ALL_PROXY=|all_proxy=/i.test(envRaw)) {
-                                hasProxyEnv = true;
-                            }
-                        } catch {
-                            // Ignore /proc read restriction
-                        }
-                        const stateConfigured = await Provisioner.isAgyRuntimeConfigured();
-                        return {
-                            pid,
-                            isPersistent: false,
-                            isUsingProxy: hasProxyEnv || stateConfigured
-                        };
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 3) {
+                    const pid = parseInt(parts[0], 10);
+                    const ppid = parseInt(parts[1], 10);
+                    if (!isNaN(pid) && pid > 0 && !isNaN(ppid)) {
+                        candidates.push({ pid, ppid });
                     }
                 }
+            }
+
+            // Prioritize the agy process owned by the current Extension Host (ppid === process.pid),
+            // followed by active parented sessions (ppid > 1), and lastly orphaned ppid === 1 processes.
+            candidates.sort((a, b) => {
+                const rank = (c: { pid: number; ppid: number }): number => {
+                    if (c.ppid === process.pid) {
+                        return 0;
+                    }
+                    if (c.ppid > 1) {
+                        return 1;
+                    }
+                    return 2;
+                };
+                return rank(a) - rank(b) || b.pid - a.pid;
+            });
+
+            if (candidates.length > 0) {
+                const chosen = candidates[0];
+                let envReadable = false;
+                let hasProxyEnv = false;
+                try {
+                    const envRaw = await fs.readFile(`/proc/${chosen.pid}/environ`, 'utf-8');
+                    envReadable = true;
+                    hasProxyEnv = /HTTP_PROXY=|HTTPS_PROXY=|http_proxy=|https_proxy=|ALL_PROXY=|all_proxy=/i.test(envRaw);
+                } catch {
+                    // Fallback when /proc/<pid>/environ is restricted
+                }
+                const stateConfigured = await Provisioner.isAgyRuntimeConfigured();
+                return {
+                    pid: chosen.pid,
+                    isPersistent: false,
+                    isUsingProxy: envReadable ? hasProxyEnv : stateConfigured
+                };
             }
         } catch {
             // AGY process not running
@@ -199,7 +217,7 @@ set -e
 echo "[AG-Wormhole] Initiating configuration rollback..."
 
 BAKS=""
-for DIR in "$HOME/.ag-wormhole" "$HOME/.antigravity-ide-server" "$HOME/.antigravity-server"; do
+for DIR in "$HOME/.ag-wormhole" "$HOME/.antigravity-ide-server" "$HOME/.antigravity-server" "$HOME/.vscode-server"; do
     FOUND=$(find "$DIR" -path "*/extensions/antigravity/bin/*" -name "language_server_linux_*.bak" -type f 2>/dev/null)
     [ -n "$FOUND" ] && BAKS="$BAKS\n$FOUND"
 done
@@ -414,10 +432,87 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
     }
 
     /**
+     * Fast L7 probe to verify whether a local port is actively responding to HTTP or SOCKS5 proxy handshakes.
+     * Prevents reclaiming healthy active tunnels or background keepers.
+     */
+    public static async isPortHealthyL7(port: number, timeoutMs: number = 800): Promise<boolean> {
+        if (!port || port <= 0 || port > 65535) {
+            return false;
+        }
+
+        const probeHttp = (): Promise<boolean> =>
+            new Promise((resolve) => {
+                const s = new net.Socket();
+                let done = false;
+                const finish = (ok: boolean) => {
+                    if (done) {
+                        return;
+                    }
+                    done = true;
+                    s.removeAllListeners();
+                    s.destroy();
+                    resolve(ok);
+                };
+                s.setTimeout(timeoutMs);
+                s.on('connect', () => {
+                    try {
+                        s.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+                    } catch {
+                        finish(false);
+                    }
+                });
+                s.on('data', (chunk) => {
+                    const text = chunk ? chunk.toString('utf8') : '';
+                    finish(/^HTTP\/1\.[01]\s+\d+/i.test(text));
+                });
+                s.on('timeout', () => finish(false));
+                s.on('error', () => finish(false));
+                s.on('close', () => finish(false));
+                s.connect(port, '127.0.0.1');
+            });
+
+        if (await probeHttp()) {
+            return true;
+        }
+
+        const probeSocks5 = (): Promise<boolean> =>
+            new Promise((resolve) => {
+                const s = new net.Socket();
+                let done = false;
+                const finish = (ok: boolean) => {
+                    if (done) {
+                        return;
+                    }
+                    done = true;
+                    s.removeAllListeners();
+                    s.destroy();
+                    resolve(ok);
+                };
+                s.setTimeout(timeoutMs);
+                s.on('connect', () => {
+                    try {
+                        s.write(Buffer.from([0x05, 0x01, 0x00]));
+                    } catch {
+                        finish(false);
+                    }
+                });
+                s.on('data', (chunk) => {
+                    finish(Boolean(chunk && chunk.length >= 2 && chunk[0] === 0x05));
+                });
+                s.on('timeout', () => finish(false));
+                s.on('error', () => finish(false));
+                s.on('close', () => finish(false));
+                s.connect(port, '127.0.0.1');
+            });
+
+        return probeSocks5();
+    }
+
+    /**
      * Collect all ancestor PIDs of the current Extension Host up to PID 1
      * to prevent terminating the active SSH daemon or remote IDE server tree.
      */
-    public static async getProtectedPids(port: number): Promise<Set<number>> {
+    public static async getProtectedPids(port: number, basePort?: number): Promise<Set<number>> {
         const protectedPids = new Set<number>([1, process.pid, process.ppid]);
 
         // 1. Walk ancestor chain via /proc or ps
@@ -441,36 +536,12 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             }
         }
 
-        // 2. Protect active dedicated background keeper listener on port+3 ONLY if verified alive at L7.
-        // If the keeper port has an orphaned listener that fails L7, allow it to be reclaimed.
-        const keeperPort = port + 3;
+        // 2. Protect active dedicated background keeper listener on (basePort ?? port) + 3 ONLY if verified alive at L7.
+        // Using basePort ensures reclaiming fallback ports (e.g. 7891, 7892) still protects the keeper on 7893.
+        const effectiveBasePort = basePort ?? port;
+        const keeperPort = effectiveBasePort + 3;
         if (keeperPort > 0 && keeperPort <= 65535 && keeperPort !== port) {
-            const isKeeperPortAlive = await new Promise<boolean>((resolve) => {
-                const s = new net.Socket();
-                let done = false;
-                const finish = (ok: boolean) => {
-                    if (done) {
-                        return;
-                    }
-                    done = true;
-                    s.removeAllListeners();
-                    s.destroy();
-                    resolve(ok);
-                };
-                s.setTimeout(500);
-                s.on('connect', () => {
-                    try {
-                        s.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
-                    } catch {
-                        finish(false);
-                    }
-                });
-                s.on('data', (chunk) => finish(Boolean(chunk && chunk.length > 0)));
-                s.on('timeout', () => finish(false));
-                s.on('error', () => finish(false));
-                s.on('close', () => finish(false));
-                s.connect(keeperPort, '127.0.0.1');
-            });
+            const isKeeperPortAlive = await Provisioner.isPortHealthyL7(keeperPort, 500);
 
             if (isKeeperPortAlive) {
                 const keeperPids = await Provisioner.getListeningPids(keeperPort);
@@ -553,44 +624,13 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             }
 
             // If it is an sshd process:
-            // 1. An sshd with zero child processes (not in protectedPids) is an orphaned tunnel session -> safe to reclaim.
-            // 2. In Remote-SSH ("bash -s"), a dead disconnected sshd may still have an old shell child
-            //    until TCP keepalive expires; if a newer persistent interactive sshd session for the same user
-            //    already exists, this older sshd holding a dead proxy port is a superseded zombie session.
+            // Only an sshd with zero child processes (and not in protectedPids) is an orphaned tunnel session.
+            // Never kill an sshd that still has live child processes (e.g. `sh` or `bash -s`), because
+            // Remote-SSH routinely maintains multiple concurrent sshd sessions across windows/multiplexed channels.
             if (cmdLine.includes('sshd')) {
                 const { stdout: childrenOut } = await execAsync(`pgrep -P ${pid} 2>/dev/null || true`);
                 if (childrenOut.trim().length === 0) {
                     return true;
-                }
-
-                const candidateStart = await Provisioner.getProcessStartTimeTicks(pid);
-                if (candidateStart !== null) {
-                    const otherPids = (await Provisioner.getUnprivilegedUserSshdPids()).filter(p => p !== pid);
-                    const otherSessions: Array<{ pid: number; startTicks: number; childArgs: string }> = [];
-
-                    for (const otherPid of otherPids) {
-                        const { stdout: otherChildren } = await execAsync(`pgrep -P ${otherPid} 2>/dev/null || true`);
-                        if (otherChildren.trim().length > 0) {
-                            const otherStart = await Provisioner.getProcessStartTimeTicks(otherPid);
-                            if (otherStart !== null && otherStart > candidateStart) {
-                                const { stdout: childArgs } = await execAsync(`ps --ppid ${otherPid} -o args= 2>/dev/null || true`);
-                                otherSessions.push({
-                                    pid: otherPid,
-                                    startTicks: otherStart,
-                                    childArgs
-                                });
-                            }
-                        }
-                    }
-
-                    const supersedingPid = Provisioner.findSupersedingSshdPid(candidateStart, otherSessions);
-                    if (supersedingPid !== null) {
-                        logger.log(
-                            `Identified superseded stale sshd session (PID ${pid}, older than active sshd PID ${supersedingPid}) for reclamation`,
-                            false
-                        );
-                        return true;
-                    }
                 }
 
                 logger.log(`Skipping active sshd session (PID ${pid}) with live child processes`, false);
@@ -606,13 +646,25 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
     /**
      * Terminate dead or zombie processes holding the remote proxy port
      */
-    public static async reclaimPort(port: number): Promise<{ success: boolean; message: string; pidsKilled: number[] }> {
+    public static async reclaimPort(
+        port: number,
+        basePort?: number
+    ): Promise<{ success: boolean; message: string; pidsKilled: number[] }> {
         if (!port || port <= 0 || port > 65535) {
             return { success: false, message: `Invalid port ${port}`, pidsKilled: [] };
         }
 
         const pidsKilled: number[] = [];
         try {
+            // Fast-path L7 guard: never reclaim a port that is actively responding to L7 proxy handshakes
+            if (await Provisioner.isPortHealthyL7(port, 800)) {
+                return {
+                    success: true,
+                    message: `Port ${port} is healthy at L7 (reclamation skipped)`,
+                    pidsKilled: []
+                };
+            }
+
             let pids = await Provisioner.getListeningPids(port);
             // Under unprivileged Linux accounts, `lsof` and `ss -lptn` hide the PID of setuid-dropped `sshd`
             // workers even when the port is actively bound in LISTEN state by a zombie `sshd` session.
@@ -623,7 +675,7 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 return { success: true, message: `No active process holding port ${port}`, pidsKilled: [] };
             }
 
-            const protectedPids = await Provisioner.getProtectedPids(port);
+            const protectedPids = await Provisioner.getProtectedPids(port, basePort);
 
             for (const pid of pids) {
                 const isSafe = await Provisioner.isSafeZombieCandidate(pid, protectedPids);
@@ -696,7 +748,7 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
         for (let i = 0; i < count; i++) {
             const p = basePort + i;
             if (p > 0 && p <= 65535) {
-                const res = await Provisioner.reclaimPort(p);
+                const res = await Provisioner.reclaimPort(p, basePort);
                 for (const pid of res.pidsKilled) {
                     if (!allKilled.includes(pid)) {
                         allKilled.push(pid);
@@ -741,7 +793,8 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             const serverDirs = [
                 path.join(homeDir, '.ag-wormhole'),
                 path.join(homeDir, '.antigravity-ide-server'),
-                path.join(homeDir, '.antigravity-server')
+                path.join(homeDir, '.antigravity-server'),
+                path.join(homeDir, '.vscode-server')
             ];
 
             // 1. Remove temporary setup and state artifacts
@@ -756,8 +809,11 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
                 }
             }
 
-            // 3. Terminate any orphaned mgraftcp processes
+            // 3. Terminate any orphaned mgraftcp processes and orphaned PPID=1 agy --hub / notify-send processes
             await execAsync('pkill -f "[m]graftcp-fakedns" 2>/dev/null || true');
+            await execAsync(
+                'ps -u $(id -u) -o pid=,ppid=,args= 2>/dev/null | awk \'$2 == 1 && (/\\/\\.gemini\\/bin\\/agy.*--hub/ || /notify-send --wait --app-name=Antigravity/) {print $1}\' | xargs -r kill -9 2>/dev/null || true'
+            );
 
             logger.log('Purged stale remote wormhole caches and temporary files.', false);
             return { success: true, message: 'Remote stale caches and orphaned processes purged.' };

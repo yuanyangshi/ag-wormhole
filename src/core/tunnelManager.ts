@@ -277,6 +277,18 @@ export class TunnelManager {
                 continue;
             }
             if (/^[a-zA-Z0-9._@-]+$/.test(token) && token !== 'localhost' && token !== '127.0.0.1') {
+                const lowerHost = token.toLowerCase();
+                // Ignore Git SSH operations (e.g. git@github.com, git-upload-pack) and file transfer utilities
+                if (
+                    lowerHost.startsWith('git@') ||
+                    /(^|\.)(github\.com|gitlab\.com|bitbucket\.org|gitee\.com|ssh\.dev\.azure\.com)$/.test(lowerHost)
+                ) {
+                    return null;
+                }
+                const trailingCmd = tokens.slice(i + 1).join(' ').toLowerCase();
+                if (/\b(git-upload-pack|git-receive-pack|git-lfs-authenticate|scp|sftp)\b/.test(trailingCmd)) {
+                    return null;
+                }
                 return { host: token, isKeeper };
             }
             break;

@@ -68,12 +68,13 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
 
     if (isLocal) {
         const sshStatus = await SSHConfigManager.getStatus();
-        const localReachable = await TunnelManager.checkPortAvailable('127.0.0.1', localPort);
+        const effectiveLocalPort = sshStatus.localPort ?? localPort;
+        const localReachable = await TunnelManager.checkPortAvailable('127.0.0.1', effectiveLocalPort);
 
         currentStatus = {
             runningLocation: 'local',
             sshConfigEnabled: sshStatus.enabled,
-            localProxyPort: localPort,
+            localProxyPort: effectiveLocalPort,
             remoteProxyPort: sshStatus.port ?? remotePort,
             remoteProxyHost: remoteHost,
             localProxyReachable: localReachable,
@@ -81,11 +82,12 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
             lastUpdated: new Date()
         };
     } else {
+        const proxyType = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
         const watchdogMetrics = TunnelWatchdog.getInstance().getMetrics();
         const isWatchdogFresh = (Date.now() - watchdogMetrics.lastChecked.getTime()) < 15000;
         const remoteReachable = isWatchdogFresh
-            ? (watchdogMetrics.state === 'HEALTHY' || watchdogMetrics.state === 'DEGRADED')
-            : await TunnelManager.checkPortAvailable(remoteHost, remotePort);
+            ? (watchdogMetrics.state === 'HEALTHY')
+            : (await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 1500)).ok;
         const lsProcess = await Provisioner.getLanguageServerProcess();
         const isMgraftcpRunning = await Provisioner.isMgraftcpRunning();
         const isAgyConfigured = await Provisioner.isAgyRuntimeConfigured();
@@ -106,6 +108,7 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
     }
 
     statusBar?.update(currentStatus);
+    StatusPanel.updateIfVisible(currentStatus);
     return currentStatus;
 }
 
@@ -321,12 +324,15 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
         const l7Check = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 500);
         if (!l7Check.ok) {
             logger.log(`Pre-emptive Ingress Guard: Primary port ${remotePort} failed L7 check, reclaiming zombie listener...`, false);
-            await Provisioner.reclaimPort(remotePort);
-            await IngressRelay.getInstance().startRelay(
-                remotePort,
-                remotePort + 1,
-                [remotePort + 1, remotePort + 2, remotePort + 3]
-            );
+            await Provisioner.reclaimPort(remotePort, remotePort);
+            const stillOccupied = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 150);
+            if (!stillOccupied) {
+                await IngressRelay.getInstance().startRelay(
+                    remotePort,
+                    remotePort + 1,
+                    [remotePort + 1, remotePort + 2, remotePort + 3]
+                );
+            }
         }
     }
 
@@ -375,10 +381,12 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
         }),
 
         vscode.commands.registerCommand(CMD_CHECK_PROXY, async () => {
-            const ok = await TunnelManager.checkPortAvailable(remoteHost, remotePort);
+            const l7 = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 2000);
             await refreshAllStatus();
             vscode.window.showInformationMessage(
-                ok ? `[AG-Wormhole] Ingress endpoint ${remoteHost}:${remotePort} is reachable.` : `[AG-Wormhole] Ingress endpoint ${remoteHost}:${remotePort} is UNREACHABLE.`
+                l7.ok
+                    ? `[AG-Wormhole] Ingress endpoint ${remoteHost}:${remotePort} is reachable (${l7.message}).`
+                    : `[AG-Wormhole] Ingress endpoint ${remoteHost}:${remotePort} is UNREACHABLE (${l7.message}).`
             );
         })
     );
@@ -418,7 +426,8 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
     if (showStartupNotification) {
         setTimeout(async () => {
             const metrics = await TunnelWatchdog.getInstance().probe();
-            const reachable = metrics.state === 'HEALTHY' || await TunnelManager.checkPortAvailable(remoteHost, remotePort);
+            await refreshAllStatus();
+            const reachable = metrics.state === 'HEALTHY' || (await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 1500)).ok;
             if (reachable) {
                 vscode.window.showInformationMessage(`[AG-Wormhole] Data plane active at ${remoteHost}:${remotePort} (${proxyType.toUpperCase()})`);
             } else {

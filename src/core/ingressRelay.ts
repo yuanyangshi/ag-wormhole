@@ -20,7 +20,7 @@ export class IngressRelay {
     private readonly maxRounds = 25;
     private readonly baseRetryDelayMs = 150;
     private readonly maxPreBufferBytes = 65536;
-    private readonly firstResponseTimeoutMs = 400;
+    private readonly firstResponseTimeoutMs = 260;
 
     private constructor() {}
 
@@ -85,7 +85,9 @@ export class IngressRelay {
 
             probeSocket.on('data', (chunk) => {
                 if (chunk && chunk.length > 0) {
-                    finish(true);
+                    const text = chunk.toString('utf8');
+                    const isHttpOrSocks = /^HTTP\/1\.[01]\s+\d+/i.test(text) || (chunk.length >= 2 && chunk[0] === 0x05);
+                    finish(isHttpOrSocks);
                 } else {
                     finish(false);
                 }
@@ -318,6 +320,15 @@ export class IngressRelay {
                         }
                         clearResponseTimer();
                         targetSocket.setTimeout(0);
+                        if (!isConnectedToCandidate && clientPreBuffer.length > 0) {
+                            try {
+                                targetSocket.write(Buffer.concat(clientPreBuffer));
+                            } catch {
+                                onCandidateFail();
+                                return;
+                            }
+                        }
+                        isConnectedToCandidate = true;
                         isPiped = true;
                         this.targetPort = candidatePort;
 
@@ -368,17 +379,33 @@ export class IngressRelay {
                                     return;
                                 }
                             }
-                            // Wait for the first upstream response byte; if candidate hangs silently
-                            // (half-open blackhole sshd), fail over and replay clientPreBuffer to the next port.
+                            // Wait for the first upstream response byte; if candidate does not respond within
+                            // firstResponseTimeoutMs, verify L7 proxy liveness out-of-band so slow outbound
+                            // HTTP CONNECT dials (>400ms) are committed safely while half-open blackhole sshd
+                            // sockets fail over and replay clientPreBuffer to the next port.
                             clearResponseTimer();
                             firstResponseTimer = setTimeout(() => {
-                                if (!isPiped) {
-                                    if (totalBufferedBytes > 0) {
-                                        onCandidateFail();
-                                    } else {
-                                        commitVerifiedPipe();
-                                    }
+                                if (isPiped || clientSocket.destroyed || targetSocket.destroyed) {
+                                    return;
                                 }
+                                if (totalBufferedBytes === 0) {
+                                    commitVerifiedPipe();
+                                    return;
+                                }
+                                this.verifyUpstreamCandidateL7(candidatePort, 220).then((l7Alive) => {
+                                    if (isPiped || clientSocket.destroyed || targetSocket.destroyed) {
+                                        return;
+                                    }
+                                    if (l7Alive) {
+                                        commitVerifiedPipe();
+                                    } else {
+                                        onCandidateFail();
+                                    }
+                                }).catch(() => {
+                                    if (!isPiped) {
+                                        onCandidateFail();
+                                    }
+                                });
                             }, this.firstResponseTimeoutMs);
                         }, 15);
                     });

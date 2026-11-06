@@ -1,4 +1,4 @@
-﻿import * as assert from 'assert';
+import * as assert from 'assert';
 import * as net from 'net';
 import { TunnelManager } from '../core/tunnelManager';
 import { Provisioner } from '../core/provisioner';
@@ -424,6 +424,12 @@ suite('Resilience & Stability Unit Tests', () => {
 
         const invalidCmd = 'node --inspect=127.0.0.1:9229 extensionHostProcess.js';
         assert.strictEqual(TunnelManager.parseSshCommandDestination(invalidCmd), null);
+
+        const gitCmd1 = 'ssh.exe git@github.com "git-upload-pack \'example/repo.git\'"';
+        assert.strictEqual(TunnelManager.parseSshCommandDestination(gitCmd1), null);
+
+        const gitCmd2 = 'ssh user@internal-git.local git-receive-pack /srv/git/repo.git';
+        assert.strictEqual(TunnelManager.parseSshCommandDestination(gitCmd2), null);
     });
 
     test('TunnelManager.sanitizeKeeperSshConfig strips wormhole include and conflicting RemoteForward directives', () => {
@@ -476,6 +482,106 @@ suite('Resilience & Stability Unit Tests', () => {
         ].join('\n');
         assert.strictEqual(Provisioner.parseStuckSendQueueBytes(out), 138744);
         assert.strictEqual(Provisioner.parseStuckSendQueueBytes(''), 0);
+    });
+
+    test('Provisioner.isPortHealthyL7 and reclaimPort skip healthy L7 proxy listeners', async () => {
+        const server = net.createServer((socket) => {
+            socket.on('data', () => {
+                socket.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+            });
+        });
+
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+        const port = (server.address() as net.AddressInfo).port;
+
+        try {
+            const healthy = await Provisioner.isPortHealthyL7(port, 800);
+            assert.strictEqual(healthy, true);
+
+            const reclaimRes = await Provisioner.reclaimPort(port, port);
+            assert.strictEqual(reclaimRes.success, true);
+            assert.strictEqual(reclaimRes.pidsKilled.length, 0);
+            assert.ok(reclaimRes.message.includes('healthy at L7'));
+        } finally {
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+    });
+
+    test('Provisioner.isPortHealthyL7 returns false for zombie TCP listeners that do not speak HTTP/SOCKS5', async () => {
+        const zombieServer = net.createServer((socket) => {
+            socket.destroy();
+        });
+
+        await new Promise<void>((resolve) => zombieServer.listen(0, '127.0.0.1', () => resolve()));
+        const port = (zombieServer.address() as net.AddressInfo).port;
+
+        try {
+            const healthy = await Provisioner.isPortHealthyL7(port, 400);
+            assert.strictEqual(healthy, false);
+        } finally {
+            await new Promise<void>((resolve) => zombieServer.close(() => resolve()));
+        }
+    });
+
+    test('IngressRelay preserves slow HTTP CONNECT requests (>400ms dial) when upstream candidate passes L7 probe', async () => {
+        const relay = IngressRelay.getInstance();
+
+        const getFreePort = async (): Promise<number> => {
+            const s = net.createServer();
+            await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+            const p = (s.address() as net.AddressInfo).port;
+            await new Promise<void>((res) => s.close(() => res()));
+            return p;
+        };
+
+        const listenPort = await getFreePort();
+
+        // Simulate a real HTTP proxy: responds immediately to local L7 HEAD probe,
+        // but takes 450ms (> firstResponseTimeoutMs) to dial an external CONNECT destination.
+        const proxySockets: net.Socket[] = [];
+        const slowConnectProxy = net.createServer((sock) => {
+            proxySockets.push(sock);
+            sock.on('data', (d) => {
+                const req = d.toString('utf8');
+                if (req.startsWith('HEAD / HTTP/1.1')) {
+                    sock.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+                    sock.end();
+                } else if (req.startsWith('CONNECT ')) {
+                    setTimeout(() => {
+                        if (!sock.destroyed) {
+                            sock.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+                        }
+                    }, 450);
+                }
+            });
+        });
+        await new Promise<void>((res) => slowConnectProxy.listen(0, '127.0.0.1', () => res()));
+        const proxyPort = (slowConnectProxy.address() as net.AddressInfo).port;
+
+        try {
+            const started = await relay.startRelay(listenPort, proxyPort, [proxyPort]);
+            assert.strictEqual(started, true);
+
+            const client = new net.Socket();
+            const responseData = await new Promise<string>((resolve, reject) => {
+                client.connect(listenPort, '127.0.0.1', () => {
+                    client.write('CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n');
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk.toString('utf8'));
+                });
+                client.on('error', (err) => reject(err));
+            });
+
+            assert.ok(responseData.includes('200 Connection Established'));
+        } finally {
+            await relay.stopRelay();
+            for (const s of proxySockets) {
+                s.destroy();
+            }
+            await new Promise<void>((res) => slowConnectProxy.close(() => res()));
+        }
     });
 });
 

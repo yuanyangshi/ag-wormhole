@@ -41,7 +41,8 @@ export const WORMHOLE_SSH_INCLUDE_LINE = `Include ${WORMHOLE_SSH_CONFIG_FILENAME
 export const SERVER_DIR_NAMES = [
     '.ag-wormhole',
     '.antigravity-ide-server',
-    '.antigravity-server'
+    '.antigravity-server',
+    '.vscode-server'
 ];
 
 // Defaults

@@ -124,14 +124,18 @@ export class SSHConfigManager {
     /**
      * Check current SSH configuration state
      */
-    public static async getStatus(): Promise<{ enabled: boolean; port?: number }> {
+    public static async getStatus(): Promise<{ enabled: boolean; port?: number; localPort?: number }> {
         try {
             const mainContent = await fs.readFile(SSHConfigManager.getMainConfigPath(), 'utf-8');
             if (mainContent.includes(WORMHOLE_SSH_INCLUDE_LINE)) {
                 const subContent = await fs.readFile(SSHConfigManager.getWormholeConfigPath(), 'utf-8');
-                const match = subContent.match(/RemoteForward\s+(\d+)\s+(?:localhost|127\.0\.0\.1):/);
+                const match = subContent.match(/RemoteForward\s+(\d+)\s+(?:localhost|127\.0\.0\.1):(\d+)/);
                 if (match) {
-                    return { enabled: true, port: parseInt(match[1], 10) };
+                    return {
+                        enabled: true,
+                        port: parseInt(match[1], 10),
+                        localPort: parseInt(match[2], 10)
+                    };
                 }
             }
         } catch {

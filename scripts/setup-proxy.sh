@@ -98,11 +98,12 @@ POSSIBLE_SERVER_DIRS=(
     "$HOME/.ag-wormhole"
     "$HOME/.antigravity-ide-server"
     "$HOME/.antigravity-server"
+    "$HOME/.vscode-server"
 )
 
 SERVER_DIR=""
 for dir in "${POSSIBLE_SERVER_DIRS[@]}"; do
-    if [ -d "$dir/bin" ]; then
+    if [ -d "$dir/bin" ] || [ -d "$dir/cli/servers" ] || [ -d "$dir/extensions" ]; then
         SERVER_DIR="$dir"
         break
     fi
@@ -209,10 +210,10 @@ check_needs_update() {
 # ============================================================================
 purge_stale_cache
 info_log "Scanning for language server binaries..."
-TARGETS=$(find "$SERVER_DIR/bin" -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$" || true)
+TARGETS=$(find "$SERVER_DIR" -maxdepth 6 -path "*/extensions/antigravity/bin/language_server_linux_*" -type f 2>/dev/null | grep -v ".bak$" || true)
 
 if [ -z "$TARGETS" ]; then
-    AGY_EXT_DIRS=$(find "$SERVER_DIR/bin" -maxdepth 3 -path "*/extensions/agy" -type d 2>/dev/null || true)
+    AGY_EXT_DIRS=$(find "$SERVER_DIR" -maxdepth 6 \( -path "*/extensions/agy" -o -path "*/extensions/google.google-antigravity*" \) -type d 2>/dev/null || true)
     if [ -n "$AGY_EXT_DIRS" ] || [ -f "$HOME/.gemini/bin/agy" ]; then
         info_log "Detected modern Antigravity AGY Runtime environment."
         STATE_FILE="$SERVER_DIR/.wormhole-state.json"
@@ -341,6 +342,7 @@ find_binaries() {
     for dir in $(ls -d "$HOME/.ag-wormhole/extensions/"*ag-wormhole*/resources/bin \
                        "$HOME/.antigravity-ide-server/extensions/"*ag-wormhole*/resources/bin \
                        "$HOME/.antigravity-server/extensions/"*ag-wormhole*/resources/bin \
+                       "$HOME/.vscode-server/extensions/"*ag-wormhole*/resources/bin \
                        2>/dev/null | sort -t'-' -k3 -V -r); do
         if [ -f "$dir/$binary_name" ]; then
             echo "$dir/$binary_name"
@@ -386,10 +388,10 @@ _probe_proxy_l7() {
     local _h="$1"
     local _p="$2"
     if [ "$PROXY_TYPE" = "socks5" ]; then
-        timeout 0.35 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf '\x05\x01\x00' >&3 && IFS= read -r -t 0.25 -n 1 _c <&3" "$_h" "$_p" 2>/dev/null
+        timeout 0.8 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf '\x05\x01\x00' >&3 && IFS= read -r -t 0.6 -n 1 _c <&3" "$_h" "$_p" 2>/dev/null
         return $?
     else
-        timeout 0.35 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 && IFS= read -r -t 0.25 _line <&3 && [ -n \"\$_line\" ]" "$_h" "$_p" 2>/dev/null
+        timeout 0.8 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 && IFS= read -r -t 0.6 _line <&3 && [ -n \"\$_line\" ]" "$_h" "$_p" 2>/dev/null
         return $?
     fi
 }

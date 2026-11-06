@@ -129,7 +129,15 @@ export class StatusPanel {
 
     public updateStatus(status: ProxyStatus): void {
         this.currentStatus = status;
-        this.updateHtml();
+        if (!this.isRunningDiagnostics) {
+            this.updateHtml();
+        }
+    }
+
+    public static updateIfVisible(status: ProxyStatus): void {
+        if (StatusPanel.currentPanel) {
+            StatusPanel.currentPanel.updateStatus(status);
+        }
     }
 
     private postMessage(msg: Record<string, unknown>): void {

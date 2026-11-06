@@ -25,6 +25,7 @@ import {
     SERVER_DIR_NAMES
 } from '../shared/constants';
 import { SSHConfigManager } from '../core/sshConfigManager';
+import { TunnelManager } from '../core/tunnelManager';
 
 const execAsync = promisify(exec);
 
@@ -135,8 +136,15 @@ export class DiagnosticsEngine {
         try {
             const reachable = await DiagnosticsEngine.checkPort(host, port);
             if (reachable) {
-                check.status = 'success';
-                check.message = `Ingress endpoint ${host}:${port} is reachable`;
+                const l7 = await TunnelManager.checkProxyL7(host, port, DEFAULT_PROXY_TYPE, 2000);
+                if (l7.ok) {
+                    check.status = 'success';
+                    check.message = `Ingress endpoint ${host}:${port} is reachable (${l7.message})`;
+                } else {
+                    check.status = 'error';
+                    check.message = `Ingress port ${host}:${port} is open at TCP layer, but L7 proxy probe failed (${l7.message})`;
+                    check.suggestion = 'Ensure your local proxy (Clash/v2ray) is running and the SSH reverse tunnel is connected.';
+                }
             } else {
                 let zombieInfo = '';
                 try {

@@ -5,6 +5,7 @@
 
 import { logger } from '../shared/logger';
 import { TunnelManager } from './tunnelManager';
+import { SSHConfigManager } from './sshConfigManager';
 import { Provisioner } from './provisioner';
 import { IngressRelay } from './ingressRelay';
 import { isRunningRemotely, isRunningLocally } from '../shared/environment';
@@ -169,19 +170,14 @@ export class TunnelWatchdog {
                 // Fallback for non-vscode standalone execution
             }
 
-            // Autonomous Relay Yielding & Native Port Reclaim Probe:
-            // Only yield IngressRelay if an external process (like sshd) is already bound to remotePort
-            // or if we never drop the listening socket on remotePort while active sessions rely on it.
-            // Keeping IngressRelay continuously bound when relaying eliminates the 150ms+ ECONNREFUSED window
-            // during periodic health probes.
-            if (isRunningRemotely() && IngressRelay.getInstance().isRelaying() && this.metrics.state === 'HEALTHY') {
-                const targetFp = IngressRelay.getInstance().getRelayInfo().targetPort;
-                if (targetFp) {
-                    const targetL7 = await TunnelManager.checkProxyL7(remoteHost, targetFp, proxyType, 1800);
-                    if (!targetL7.ok) {
-                        // Current relay target degraded; force immediate re-hunt across fallback cluster
-                        logger.log(`Tunnel Watchdog: Relay target port ${targetFp} degraded, re-hunting fallback cluster...`, false);
+            if (isRunningLocally()) {
+                try {
+                    const sshStatus = await SSHConfigManager.getStatus();
+                    if (sshStatus.enabled && sshStatus.localPort) {
+                        localPort = sshStatus.localPort;
                     }
+                } catch {
+                    // Use configured localPort
                 }
             }
 
@@ -251,12 +247,26 @@ export class TunnelWatchdog {
                                 recoveredViaFallback = true;
                                 break;
                             } else {
-                                await Provisioner.reclaimPort(remotePort);
+                                await Provisioner.reclaimPort(remotePort, remotePort);
                                 const relaySuccess = await IngressRelay.getInstance().startRelay(remotePort, fp, fallbackPorts);
                                 if (relaySuccess) {
                                     l7Result = { ok: true, message: `Relayed via active tunnel port ${fp}` };
                                     this.metrics.activeTunnelPort = fp;
                                     this.metrics.isRelaying = true;
+                                    recoveredViaFallback = true;
+                                    break;
+                                } else {
+                                    // Another Extension Host's IngressRelay or a newly bound sshd already holds remotePort.
+                                    // Re-verify primary port L7 or treat the verified fallback tunnel as healthy without EADDRINUSE loops.
+                                    const primaryRecheck = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 1800);
+                                    if (primaryRecheck.ok) {
+                                        l7Result = primaryRecheck;
+                                        this.metrics.activeTunnelPort = remotePort;
+                                    } else {
+                                        l7Result = { ok: true, message: `Active tunnel verified on fallback port ${fp}` };
+                                        this.metrics.activeTunnelPort = fp;
+                                    }
+                                    this.metrics.isRelaying = false;
                                     recoveredViaFallback = true;
                                     break;
                                 }
@@ -266,26 +276,17 @@ export class TunnelWatchdog {
                 }
 
                 // If no fallback port is healthy yet, ensure the Zero-Refusal Ingress Shield remains active
-                // on remotePort so incoming requests wait in the buffer rather than getting ECONNREFUSED.
+                // on remotePort ONLY if remotePort is not already held by another Extension Host process.
                 if (!recoveredViaFallback && !IngressRelay.getInstance().isRelaying()) {
-                    await Provisioner.reclaimPort(remotePort);
-                    await IngressRelay.getInstance().startRelay(remotePort, remotePort + 1, fallbackPorts);
+                    await Provisioner.reclaimPort(remotePort, remotePort);
+                    const portStillOccupied = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 150);
+                    if (!portStillOccupied) {
+                        await IngressRelay.getInstance().startRelay(remotePort, remotePort + 1, fallbackPorts);
+                    }
                 }
             }
 
-            // Ping-Pong Standby Port Guard management:
-            // When IngressRelay owns remotePort, ensure at least one fallback port (remotePort+2) is
-            // reserved in standby while remotePort+1 is unbound, and released once remotePort+1 is bound.
-            if (isRunningRemotely() && IngressRelay.getInstance().isRelaying()) {
-                const fp1Bound = await TunnelManager.checkPortAvailable(remoteHost, remotePort + 1, 200);
-                if (fp1Bound) {
-                    await IngressRelay.getInstance().releaseStandbyGuard();
-                } else {
-                    await IngressRelay.getInstance().ensureStandbyGuard(remotePort + 2);
-                }
-            }
-
-            const effectiveReachable = isReachable || Boolean(this.metrics.isRelaying && l7Result?.ok);
+            const effectiveReachable = isReachable || Boolean(l7Result?.ok);
 
             const prevState = this.metrics.state;
             if (effectiveReachable && l7Result?.ok) {

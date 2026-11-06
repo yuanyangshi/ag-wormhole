@@ -14,9 +14,12 @@ esbuild.js
 **/.vscode-test.*
 .agents/**
 AGENTS.md
+CHANGELOG.md
+*.vsix
 指南*.md
 !dist
 !dist/**
+dist/**/*.map
 !resources
 !resources/**
 !scripts
