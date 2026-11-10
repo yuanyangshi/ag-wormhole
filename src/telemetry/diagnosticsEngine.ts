@@ -88,7 +88,16 @@ export class DiagnosticsEngine {
             const mainPath = SSHConfigManager.getMainConfigPath();
             const content = await fs.readFile(mainPath, 'utf-8');
 
-            if (content.includes(WORMHOLE_SSH_INCLUDE_LINE)) {
+            if (/Include\s+.*config\.wormhole/i.test(content)) {
+                // Check for duplicate RemoteForward in main config that could collide
+                const duplicateForwards = content.match(/^\s*RemoteForward\s+\d+\s+/gim);
+                if (duplicateForwards && duplicateForwards.length > 0) {
+                    check.status = 'warning';
+                    check.message = `Redundant RemoteForward directive detected in main SSH config (${duplicateForwards.length} occurrence(s)).`;
+                    check.suggestion = 'Remove redundant RemoteForward entries from individual Host blocks in ~/.ssh/config so config.wormhole manages them cleanly without port collisions.';
+                    return check;
+                }
+
                 const wormholePath = SSHConfigManager.getWormholeConfigPath();
                 try {
                     const wormholeContent = await fs.readFile(wormholePath, 'utf-8');

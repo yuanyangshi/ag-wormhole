@@ -17,12 +17,15 @@ import {
     CFG_WATCHDOG_INTERVAL,
     CFG_AUTO_RECLAIM_PORT,
     CFG_PROXY_TYPE,
+    CFG_SUPPRESS_UNREACHABLE_WARNING,
     DEFAULT_PROXY_HOST,
     DEFAULT_PROXY_PORT,
     DEFAULT_PROXY_TYPE,
     DEFAULT_WATCHDOG_INTERVAL_SEC,
+    ALL_FALLBACK_PORT_OFFSETS,
     CMD_RECLAIM_PORT,
-    CMD_SHOW_STATUS_PANEL
+    CMD_SHOW_STATUS_PANEL,
+    CMD_BYPASS_TERMINAL_PROXY
 } from '../shared/constants';
 
 export type TunnelHealthState = 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED';
@@ -37,6 +40,7 @@ export interface WatchdogMetrics {
     l7Message?: string;
     activeTunnelPort?: number;
     isRelaying?: boolean;
+    isProlongedOutage?: boolean;
 }
 
 export interface IDisposable {
@@ -50,10 +54,13 @@ export class TunnelWatchdog {
     private metrics: WatchdogMetrics;
     private stateChangeCallbacks: ((metrics: WatchdogMetrics) => void)[] = [];
     private isProbing = false;
+    private isMutedForSession = false;
     private probeCount = 0;
     private checkIntervalMs = 10000; // default 10s non-intrusive probe
     private readonly fastRecoveryIntervalMs = 2500; // 2.5s fast-path self-healing probe
+    private readonly backoffIntervalMs = 30000; // 30s smart backoff probe during prolonged outages
     private readonly failureThreshold = 2; // trigger recovery early after 2 consecutive failures
+    private readonly prolongedFailureThreshold = 12; // ~1 minute persistent failure, enter smart backoff
     private readonly reclaimCooldownMs = 15000; // 15s between automatic port reclaim attempts
 
     private constructor() {
@@ -108,7 +115,13 @@ export class TunnelWatchdog {
         }
 
         const isUnhealthy = this.metrics.state === 'DEGRADED' || this.metrics.state === 'DISCONNECTED';
-        const delayMs = isUnhealthy ? this.fastRecoveryIntervalMs : this.checkIntervalMs;
+        const isProlonged = (this.metrics.consecutiveFailures || 0) >= this.prolongedFailureThreshold;
+        let delayMs = this.checkIntervalMs;
+        if (isProlonged) {
+            delayMs = this.backoffIntervalMs;
+        } else if (isUnhealthy) {
+            delayMs = this.fastRecoveryIntervalMs;
+        }
 
         this.timer = setInterval(() => {
             this.probe();
@@ -124,6 +137,18 @@ export class TunnelWatchdog {
             clearTimeout(ft);
         }
         this.fastPathTimers = [];
+    }
+
+    public muteSession(): void {
+        this.isMutedForSession = true;
+    }
+
+    public unmuteSession(): void {
+        this.isMutedForSession = false;
+    }
+
+    public isMuted(): boolean {
+        return this.isMutedForSession;
     }
 
     public onStateChange(callback: (metrics: WatchdogMetrics) => void): IDisposable {
@@ -215,7 +240,7 @@ export class TunnelWatchdog {
             if (isRunningRemotely() && (!isReachable || !l7Result?.ok)) {
                 const wasRelaying = IngressRelay.getInstance().isRelaying();
                 const primaryPids = (!wasRelaying && isReachable) ? await Provisioner.getListeningPids(remotePort) : [];
-                const fallbackPorts = [remotePort + 1, remotePort + 2, remotePort + 3];
+                const fallbackPorts = ALL_FALLBACK_PORT_OFFSETS.map(o => remotePort + o);
                 let recoveredViaFallback = false;
 
                 for (const fp of fallbackPorts) {
@@ -275,14 +300,16 @@ export class TunnelWatchdog {
                     }
                 }
 
-                // If no fallback port is healthy yet, ensure the Zero-Refusal Ingress Shield remains active
-                // on remotePort ONLY if remotePort is not already held by another Extension Host process.
-                if (!recoveredViaFallback && !IngressRelay.getInstance().isRelaying()) {
-                    await Provisioner.reclaimPort(remotePort, remotePort);
-                    const portStillOccupied = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 150);
-                    if (!portStillOccupied) {
-                        await IngressRelay.getInstance().startRelay(remotePort, remotePort + 1, fallbackPorts);
+                // If no fallback port is healthy, never blindly seize remotePort into a dead loop.
+                // Instead, stop any existing dead relay to keep remotePort completely unblocked
+                // for native incoming SSH reverse port forwards.
+                if (!recoveredViaFallback) {
+                    if (wasRelaying) {
+                        logger.log(`Tunnel Watchdog: All fallback ports offline. Releasing IngressRelay on port ${remotePort}...`, false);
+                        await IngressRelay.getInstance().stopRelay();
+                        this.metrics.isRelaying = false;
                     }
+                    await Provisioner.reclaimPort(remotePort, remotePort);
                 }
             }
 
@@ -304,6 +331,7 @@ export class TunnelWatchdog {
                 this.metrics.consecutiveFailures = 0;
                 this.metrics.state = 'HEALTHY';
                 this.metrics.reconnectPromptShown = false;
+                this.metrics.isProlongedOutage = false;
 
                 if (prevState !== 'HEALTHY') {
                     this.scheduleNextProbe();
@@ -333,13 +361,17 @@ export class TunnelWatchdog {
                 this.metrics.l7Health = false;
                 this.metrics.l7Message = l7Result?.message || 'L7 handshake failed';
                 this.metrics.consecutiveFailures++;
+                const isFirstProlonged = this.metrics.consecutiveFailures === this.prolongedFailureThreshold;
+                if (this.metrics.consecutiveFailures >= this.prolongedFailureThreshold) {
+                    this.metrics.isProlongedOutage = true;
+                }
                 if (isRunningRemotely() && this.metrics.consecutiveFailures >= this.failureThreshold) {
                     this.metrics.state = 'DISCONNECTED';
                     await this.handleTunnelDisconnection(remotePort);
                 } else {
                     this.metrics.state = 'DEGRADED';
                 }
-                if (prevState === 'HEALTHY') {
+                if (prevState === 'HEALTHY' || isFirstProlonged) {
                     this.scheduleNextProbe();
                 }
                 logger.log(`Tunnel Watchdog: Port open but L7 proxy probe degraded: ${this.metrics.l7Message}`, isRunningLocally());
@@ -347,13 +379,17 @@ export class TunnelWatchdog {
                 this.metrics.l7Health = false;
                 this.metrics.l7Message = 'All ingress tunnel ports unreachable';
                 this.metrics.consecutiveFailures++;
+                const isFirstProlonged = this.metrics.consecutiveFailures === this.prolongedFailureThreshold;
+                if (this.metrics.consecutiveFailures >= this.prolongedFailureThreshold) {
+                    this.metrics.isProlongedOutage = true;
+                }
                 if (this.metrics.consecutiveFailures >= this.failureThreshold) {
                     this.metrics.state = 'DISCONNECTED';
                     await this.handleTunnelDisconnection(remotePort);
                 } else {
                     this.metrics.state = 'DEGRADED';
                 }
-                if (prevState === 'HEALTHY') {
+                if (prevState === 'HEALTHY' || isFirstProlonged) {
                     this.scheduleNextProbe();
                 }
                 logger.log(
@@ -389,38 +425,66 @@ export class TunnelWatchdog {
             const now = Date.now();
             const lastAttemptMs = this.metrics.lastRecoveryAttempt?.getTime() ?? 0;
             const cooldownElapsed = now - lastAttemptMs >= this.reclaimCooldownMs;
+            const isProlonged = (this.metrics.consecutiveFailures || 0) >= this.prolongedFailureThreshold;
 
             // Attempt autonomous zombie port reclamation on remote failure (respecting cooldown)
-            // Automatically clears all ports across the forwarding cluster (primary, fallbacks, and keeper)
-            if (autoReclaim && cooldownElapsed) {
+            // If outage is prolonged (user is connected in direct mode without local IDE), avoid thrashing port reclamation
+            if (autoReclaim && cooldownElapsed && !isProlonged) {
                 this.metrics.lastRecoveryAttempt = new Date();
-                logger.log(`Tunnel Watchdog: Autonomous self-healing triggered for remote ports ${remotePort}-${remotePort + 3}`, false);
-                const result = await Provisioner.reclaimPortRange(remotePort, 4);
+                const clusterRange = ALL_FALLBACK_PORT_OFFSETS.length + 1;
+                logger.log(`Tunnel Watchdog: Autonomous self-healing triggered for remote ports ${remotePort}-${remotePort + clusterRange - 1}`, false);
+                const result = await Provisioner.reclaimPortRange(remotePort, clusterRange);
                 if (result.success && result.pidsKilled.length > 0) {
                     logger.log(`Tunnel Watchdog: Terminated ${result.pidsKilled.length} zombie process(es): ${result.pidsKilled.join(', ')}`, false);
                 }
-                if (!IngressRelay.getInstance().isRelaying()) {
-                    await IngressRelay.getInstance().startRelay(
-                        remotePort,
-                        remotePort + 1,
-                        [remotePort + 1, remotePort + 2, remotePort + 3]
-                    );
+                // Verify if any fallback port is alive before starting relay
+                const fallbackPorts = ALL_FALLBACK_PORT_OFFSETS.map(o => remotePort + o);
+                let liveFp: number | undefined;
+                for (const fp of fallbackPorts) {
+                    if (await TunnelManager.checkPortAvailable('127.0.0.1', fp, 200)) {
+                        const fpL7 = await TunnelManager.checkProxyL7('127.0.0.1', fp, 'http', 300);
+                        if (fpL7.ok) {
+                            liveFp = fp;
+                            break;
+                        }
+                    }
+                }
+
+                if (liveFp) {
+                    if (!IngressRelay.getInstance().isRelaying()) {
+                        await IngressRelay.getInstance().startRelay(remotePort, liveFp, fallbackPorts);
+                    }
+                } else if (IngressRelay.getInstance().isRelaying()) {
+                    await IngressRelay.getInstance().stopRelay();
                 }
             }
 
+            let suppressWarning = false;
+            try {
+                const vscode = require('vscode');
+                const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+                suppressWarning = config.get(CFG_SUPPRESS_UNREACHABLE_WARNING, false);
+            } catch {
+                // Default false
+            }
+
             // Show non-intrusive notification only after prolonged outage (>= 8 probes, ~80s)
-            // Informing user that background self-healing is running, without requiring manual intervention.
-            if (this.metrics.consecutiveFailures >= 8 && !this.metrics.reconnectPromptShown) {
+            // If muted for this session or explicitly suppressed by user, skip notification
+            if (this.metrics.consecutiveFailures >= 8 && !this.metrics.reconnectPromptShown && !this.isMutedForSession && !suppressWarning) {
                 this.metrics.reconnectPromptShown = true;
                 try {
                     const vscode = require('vscode');
                     vscode.window.showWarningMessage(
-                        '[AG-Wormhole] Proxy tunnel unreachable (background self-healing is active). If local proxy (Clash/v2ray) is stopped, please restart it.',
-                        'Run Diagnostics',
+                        '[AG-Wormhole] Proxy tunnel unreachable. Ensure local proxy (Clash/v2ray) is running and local IDE/SSH reverse tunnel is active.',
+                        'Switch to Direct Mode',
+                        'Mute Session',
                         'Open Dashboard'
                     ).then((action: string | undefined) => {
-                        if (action === 'Run Diagnostics') {
-                            vscode.commands.executeCommand('ag-wormhole.diagnose');
+                        if (action === 'Switch to Direct Mode') {
+                            vscode.commands.executeCommand(CMD_BYPASS_TERMINAL_PROXY);
+                        } else if (action === 'Mute Session') {
+                            this.muteSession();
+                            vscode.window.showInformationMessage('[AG-Wormhole] Unreachable warnings muted for this session. Link status is tracked in the status bar.');
                         } else if (action === 'Open Dashboard') {
                             vscode.commands.executeCommand(CMD_SHOW_STATUS_PANEL);
                         }

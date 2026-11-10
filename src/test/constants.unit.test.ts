@@ -14,7 +14,12 @@ suite('Constants and Branding Validation', () => {
             constants.CMD_SHOW_STATUS_PANEL,
             constants.CMD_REFRESH_STATUS,
             constants.CMD_DIAGNOSE,
-            constants.CMD_SHOW_TRAFFIC
+            constants.CMD_SHOW_TRAFFIC,
+            constants.CMD_RECLAIM_PORT,
+            constants.CMD_OPTIMIZE_SSH,
+            constants.CMD_PURGE_CACHE,
+            constants.CMD_BYPASS_TERMINAL_PROXY,
+            constants.CMD_RESTORE_TERMINAL_PROXY
         ];
 
         for (const cmd of commandValues) {
@@ -36,5 +41,10 @@ suite('Constants and Branding Validation', () => {
 
     test('default ports should be standard 7890', () => {
         assert.strictEqual(constants.DEFAULT_PROXY_PORT, 7890);
+        assert.strictEqual(constants.KEEPER_PORT_OFFSET, 3);
+        assert.ok(Array.isArray(constants.MAIN_FALLBACK_PORT_OFFSETS));
+        assert.ok(!constants.MAIN_FALLBACK_PORT_OFFSETS.includes(constants.KEEPER_PORT_OFFSET));
+        assert.ok(Array.isArray(constants.ALL_FALLBACK_PORT_OFFSETS));
+        assert.ok(constants.ALL_FALLBACK_PORT_OFFSETS.includes(constants.KEEPER_PORT_OFFSET));
     });
 });

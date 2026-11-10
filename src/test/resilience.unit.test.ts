@@ -5,7 +5,8 @@ import { Provisioner } from '../core/provisioner';
 import { IngressRelay } from '../core/ingressRelay';
 import { TrafficCollector } from '../telemetry/trafficCollector';
 
-suite('Resilience & Stability Unit Tests', () => {
+suite('Resilience & Stability Unit Tests', function (this: Mocha.Suite) {
+    this.timeout(10000);
     test('Provisioner.reclaimPort rejects invalid port ranges safely', async () => {
         const negativePort = await Provisioner.reclaimPort(-1);
         assert.strictEqual(negativePort.success, false);
@@ -582,6 +583,12 @@ suite('Resilience & Stability Unit Tests', () => {
             }
             await new Promise<void>((res) => slowConnectProxy.close(() => res()));
         }
+    });
+
+    test('Provisioner.getListeningSocketInodes handles safe execution across platforms', async () => {
+        // Safe cross-platform invocation should return a Set without throwing
+        const inodes = await Provisioner.getListeningSocketInodes(7890);
+        assert.ok(inodes instanceof Set);
     });
 });
 

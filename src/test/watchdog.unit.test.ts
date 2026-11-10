@@ -24,5 +24,14 @@ suite('TunnelWatchdog Unit Tests', () => {
 
         disposable.dispose();
     });
+
+    test('watchdog correctly toggles session muting', () => {
+        const watchdog = TunnelWatchdog.getInstance();
+        assert.strictEqual(watchdog.isMuted(), false);
+        watchdog.muteSession();
+        assert.strictEqual(watchdog.isMuted(), true);
+        watchdog.unmuteSession();
+        assert.strictEqual(watchdog.isMuted(), false);
+    });
 });
 

@@ -62,6 +62,10 @@ export class StatusBarController implements vscode.Disposable {
             if (status.isRelaying) {
                 tooltip += `Tunnel Bridge: Active (Auto-bridged via port ${status.activeTunnelPort})\n`;
             }
+            if (status.isTerminalProxyBypassed) {
+                tooltip += `Terminal Proxy: Bypassed (Direct Mode)\n`;
+                label = 'AGW (Direct)';
+            }
             tooltip += `Language Server Interception: ${status.languageServerConfigured ? 'Injected' : 'Pending'}\n`;
 
             if (status.remoteProxyReachable && status.languageServerConfigured) {

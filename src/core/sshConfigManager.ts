@@ -8,7 +8,8 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import {
     WORMHOLE_SSH_CONFIG_FILENAME,
-    WORMHOLE_SSH_INCLUDE_LINE
+    WORMHOLE_SSH_INCLUDE_LINE,
+    MAIN_FALLBACK_PORT_OFFSETS
 } from '../shared/constants';
 import { logger } from '../shared/logger';
 
@@ -44,12 +45,11 @@ export class SSHConfigManager {
 
             if (enable) {
                 // 1. Write the dedicated wormhole sub-config with high-availability keepalive parameters
-                // Forward primary port and fallback ports (remotePort + 1, remotePort + 2) to eliminate
-                // reconnection failure when primary port is temporarily held by dead zombie sockets.
+                // Forward primary port and fallback cluster ports to eliminate reconnection failure
+                // when primary port is temporarily held by dead zombie sockets.
                 const forwardLines = [
                     `    RemoteForward ${remotePort} 127.0.0.1:${localPort}`,
-                    `    RemoteForward ${remotePort + 1} 127.0.0.1:${localPort}`,
-                    `    RemoteForward ${remotePort + 2} 127.0.0.1:${localPort}`,
+                    ...MAIN_FALLBACK_PORT_OFFSETS.map(offset => `    RemoteForward ${remotePort + offset} 127.0.0.1:${localPort}`),
                 ];
 
                 const content = [
@@ -84,7 +84,7 @@ export class SSHConfigManager {
                     // File may not exist yet, which is fine
                 }
 
-                if (!mainContent.includes(WORMHOLE_SSH_INCLUDE_LINE)) {
+                if (!/Include\s+.*config\.wormhole/i.test(mainContent)) {
                     mainContent = `${WORMHOLE_SSH_INCLUDE_LINE}\n${mainContent}`;
                     const tempMainPath = `${mainConfigPath}.tmp`;
                     await fs.writeFile(tempMainPath, mainContent, 'utf-8');
@@ -95,9 +95,8 @@ export class SSHConfigManager {
                 // 1. Remove Include line from main config
                 try {
                     let mainContent = await fs.readFile(mainConfigPath, 'utf-8');
-                    if (mainContent.includes(WORMHOLE_SSH_INCLUDE_LINE)) {
-                        mainContent = mainContent.replace(`${WORMHOLE_SSH_INCLUDE_LINE}\n`, '');
-                        mainContent = mainContent.replace(WORMHOLE_SSH_INCLUDE_LINE, '');
+                    if (/Include\s+.*config\.wormhole/i.test(mainContent)) {
+                        mainContent = mainContent.replace(/^.*Include\s+.*config\.wormhole.*(\r?\n)?/gim, '');
                         const tempMainPath = `${mainConfigPath}.tmp`;
                         await fs.writeFile(tempMainPath, mainContent, 'utf-8');
                         await fs.rename(tempMainPath, mainConfigPath);
@@ -127,7 +126,7 @@ export class SSHConfigManager {
     public static async getStatus(): Promise<{ enabled: boolean; port?: number; localPort?: number }> {
         try {
             const mainContent = await fs.readFile(SSHConfigManager.getMainConfigPath(), 'utf-8');
-            if (mainContent.includes(WORMHOLE_SSH_INCLUDE_LINE)) {
+            if (/Include\s+.*config\.wormhole/i.test(mainContent)) {
                 const subContent = await fs.readFile(SSHConfigManager.getWormholeConfigPath(), 'utf-8');
                 const match = subContent.match(/RemoteForward\s+(\d+)\s+(?:localhost|127\.0\.0\.1):(\d+)/);
                 if (match) {

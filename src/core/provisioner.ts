@@ -269,27 +269,28 @@ echo "[AG-Wormhole] Initiating configuration rollback..."
 
 BAKS=""
 for DIR in "$HOME/.ag-wormhole" "$HOME/.antigravity-ide-server" "$HOME/.antigravity-server" "$HOME/.vscode-server"; do
-    FOUND=$(find "$DIR" -path "*/extensions/antigravity/bin/*" -name "language_server_linux_*.bak" -type f 2>/dev/null)
-    [ -n "$FOUND" ] && BAKS="$BAKS\n$FOUND"
+    FOUND=$(find "$DIR" -path "*/extensions/antigravity/bin/*" -name "language_server_linux_*.bak" -type f 2>/dev/null || true)
+    [ -n "$FOUND" ] && BAKS="$BAKS\\n$FOUND"
+    rm -f "$DIR/.wormhole-state.json" "$DIR/.wormhole-state.json.tmp."* 2>/dev/null || true
 done
 BAKS=$(echo -e "$BAKS" | sed '/^$/d')
 
-if [ -z "$BAKS" ]; then
-    echo "[AG-Wormhole] Nothing to rollback."
-    exit 0
-fi
+rm -f "$HOME/.ag-wormhole/proxy.env" "$HOME/.ag-wormhole/proxy.env.tmp."* 2>/dev/null || true
+rm -rf /tmp/ag_wormhole_* /tmp/*wormhole*.sh /tmp/wormhole_* 2>/dev/null || true
 
 RESTORED=0
-while IFS= read -r BAK; do
-    [ -z "$BAK" ] && continue
-    TARGET="\${BAK%.bak}"
-    echo "Restoring: $TARGET"
-    [ -f "$TARGET" ] && rm -f "$TARGET"
-    mv "$BAK" "$TARGET"
-    RESTORED=$((RESTORED + 1))
-done <<< "$BAKS"
+if [ -n "$BAKS" ]; then
+    while IFS= read -r BAK; do
+        [ -z "$BAK" ] && continue
+        TARGET="\${BAK%.bak}"
+        echo "Restoring: $TARGET"
+        [ -f "$TARGET" ] && rm -f "$TARGET"
+        mv "$BAK" "$TARGET"
+        RESTORED=$((RESTORED + 1))
+    done <<< "$BAKS"
+fi
 
-echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
+echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtime state reset."
 `;
     }
 
@@ -450,6 +451,71 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
         } catch {
             return [];
         }
+    }
+
+    /**
+     * Retrieve socket inode numbers associated with a listening TCP port from /proc/net/tcp{,6}
+     */
+    public static async getListeningSocketInodes(port: number): Promise<Set<string>> {
+        const inodes = new Set<string>();
+        if (!port || port <= 0 || port > 65535) {
+            return inodes;
+        }
+        const hexPort = port.toString(16).toUpperCase().padStart(4, '0');
+        const files = ['/proc/net/tcp', '/proc/net/tcp6'];
+
+        for (const file of files) {
+            try {
+                const content = await fs.readFile(file, 'utf-8');
+                const lines = content.split('\n');
+                for (let i = 1; i < lines.length; i++) {
+                    const line = lines[i].trim();
+                    if (!line) {
+                        continue;
+                    }
+                    const parts = line.split(/\s+/);
+                    if (parts.length >= 10 && parts[3] === '0A') {
+                        const localAddr = parts[1];
+                        if (localAddr && localAddr.endsWith(`:${hexPort}`)) {
+                            const inode = parts[9];
+                            if (inode && inode !== '0') {
+                                inodes.add(inode);
+                            }
+                        }
+                    }
+                }
+            } catch {
+                // Ignore read errors
+            }
+        }
+        return inodes;
+    }
+
+    /**
+     * Verify whether a process holds a socket descriptor matching any of the specified inodes
+     */
+    public static async processHoldsSocketInode(pid: number, targetInodes: Set<string>): Promise<boolean> {
+        if (targetInodes.size === 0) {
+            return false;
+        }
+        try {
+            const fdDir = `/proc/${pid}/fd`;
+            const fds = await fs.readdir(fdDir);
+            for (const fd of fds) {
+                try {
+                    const link = await fs.readlink(path.join(fdDir, fd));
+                    const match = /^socket:\[(\d+)\]$/.exec(link);
+                    if (match && targetInodes.has(match[1])) {
+                        return true;
+                    }
+                } catch {
+                    // Ignore inaccessible fd
+                }
+            }
+        } catch {
+            // Process might have terminated or /proc is restricted
+        }
+        return false;
     }
 
     /**
@@ -719,8 +785,19 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored."
             let pids = await Provisioner.getListeningPids(port);
             // Under unprivileged Linux accounts, `lsof` and `ss -lptn` hide the PID of setuid-dropped `sshd`
             // workers even when the port is actively bound in LISTEN state by a zombie `sshd` session.
+            // Match against socket inodes in /proc/net/tcp{,6} to avoid terminating unrelated sshd processes.
             if (pids.length === 0 && await Provisioner.isPortListeningUnprivileged(port)) {
-                pids = await Provisioner.getUnprivilegedUserSshdPids();
+                const listeningInodes = await Provisioner.getListeningSocketInodes(port);
+                const candidateSshdPids = await Provisioner.getUnprivilegedUserSshdPids();
+                if (listeningInodes.size > 0) {
+                    for (const candidatePid of candidateSshdPids) {
+                        if (await Provisioner.processHoldsSocketInode(candidatePid, listeningInodes)) {
+                            pids.push(candidatePid);
+                        }
+                    }
+                } else {
+                    pids = candidateSshdPids;
+                }
             }
             if (pids.length === 0) {
                 return { success: true, message: `No active process holding port ${port}`, pidsKilled: [] };

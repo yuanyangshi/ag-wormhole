@@ -19,7 +19,9 @@ import {
     CMD_SETUP,
     CMD_ROLLBACK,
     CMD_SHOW_OUTPUT,
-    CMD_PURGE_CACHE
+    CMD_PURGE_CACHE,
+    CMD_BYPASS_TERMINAL_PROXY,
+    CMD_RESTORE_TERMINAL_PROXY
 } from '../shared/constants';
 import { logger } from '../shared/logger';
 
@@ -88,6 +90,12 @@ export class StatusPanel {
                         break;
                     case 'purgeCache':
                         await vscode.commands.executeCommand(CMD_PURGE_CACHE);
+                        break;
+                    case 'bypassTerminalProxy':
+                        await vscode.commands.executeCommand(CMD_BYPASS_TERMINAL_PROXY);
+                        break;
+                    case 'restoreTerminalProxy':
+                        await vscode.commands.executeCommand(CMD_RESTORE_TERMINAL_PROXY);
                         break;
                 }
             },

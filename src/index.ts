@@ -16,10 +16,12 @@ import {
     CFG_SHOW_STATUS_ON_STARTUP,
     CFG_PROXY_TYPE,
     CFG_AUTO_INJECT_TERMINAL_PROXY,
+    CFG_AUTO_BYPASS_TERMINAL_ON_DISCONNECTED,
     DEFAULT_PROXY_PORT,
     DEFAULT_PROXY_HOST,
     DEFAULT_PROXY_TYPE,
     AUTO_REFRESH_INTERVAL_SEC,
+    ALL_FALLBACK_PORT_OFFSETS,
     CMD_SETUP,
     CMD_ROLLBACK,
     CMD_ENABLE_FORWARDING,
@@ -33,7 +35,9 @@ import {
     CMD_SHOW_TRAFFIC,
     CMD_RECLAIM_PORT,
     CMD_OPTIMIZE_SSH,
-    CMD_PURGE_CACHE
+    CMD_PURGE_CACHE,
+    CMD_BYPASS_TERMINAL_PROXY,
+    CMD_RESTORE_TERMINAL_PROXY
 } from './shared/constants';
 import { SSHConfigManager } from './core/sshConfigManager';
 import { TunnelManager } from './core/tunnelManager';
@@ -47,6 +51,7 @@ import { TunnelWatchdog } from './core/watchdog';
 let statusBar: StatusBarController;
 let trafficCollector: TrafficCollector;
 let autoRefreshTimer: NodeJS.Timeout | undefined;
+let isTerminalProxyBypassed = false;
 
 let currentStatus: ProxyStatus = {
     runningLocation: 'local',
@@ -103,6 +108,7 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
             languageServerConfigured: Boolean(lsProcess?.isUsingProxy || isMgraftcpRunning || isAgyConfigured),
             activeTunnelPort: watchdogMetrics.activeTunnelPort || remotePort,
             isRelaying: watchdogMetrics.isRelaying,
+            isTerminalProxyBypassed: isTerminalProxyBypassed,
             lastUpdated: new Date()
         };
     }
@@ -202,12 +208,98 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 vscode.window.showInformationMessage(`[AG-Wormhole] ${res.message} Sandbox re-synchronized.`);
             }
             await refreshAllStatus();
+        }),
+
+        vscode.commands.registerCommand(CMD_BYPASS_TERMINAL_PROXY, async () => {
+            isTerminalProxyBypassed = true;
+            if (context.environmentVariableCollection) {
+                context.environmentVariableCollection.clear();
+            }
+            delete process.env.http_proxy;
+            delete process.env.https_proxy;
+            delete process.env.HTTP_PROXY;
+            delete process.env.HTTPS_PROXY;
+            delete process.env.all_proxy;
+            delete process.env.ALL_PROXY;
+            await refreshAllStatus();
+            vscode.window.showInformationMessage('[AG-Wormhole] Switched to Direct Mode. Proxy environment variables cleared from remote terminals.');
+        }),
+
+        vscode.commands.registerCommand(CMD_RESTORE_TERMINAL_PROXY, async () => {
+            isTerminalProxyBypassed = false;
+            const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+            const host = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
+            const port = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
+            const type = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
+            const proxyUrl = `http://${host}:${port}`;
+            const allProxyUrl = `${type}://${host}:${port}`;
+
+            process.env.http_proxy = proxyUrl;
+            process.env.https_proxy = proxyUrl;
+            process.env.HTTP_PROXY = proxyUrl;
+            process.env.HTTPS_PROXY = proxyUrl;
+            process.env.all_proxy = allProxyUrl;
+            process.env.ALL_PROXY = allProxyUrl;
+
+            if (context.environmentVariableCollection) {
+                context.environmentVariableCollection.replace('http_proxy', proxyUrl);
+                context.environmentVariableCollection.replace('https_proxy', proxyUrl);
+                context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
+                context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
+                context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
+                context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
+            }
+            await refreshAllStatus();
+            vscode.window.showInformationMessage(`[AG-Wormhole] Restored terminal proxy injection (${proxyUrl}).`);
         })
     );
 
     const watchdog = TunnelWatchdog.getInstance();
     context.subscriptions.push(new vscode.Disposable(() => watchdog.stop()));
-    watchdog.onStateChange(async () => {
+    watchdog.onStateChange(async (metrics) => {
+        if (isRunningRemotely()) {
+            const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+            const autoBypass = config.get<boolean>(CFG_AUTO_BYPASS_TERMINAL_ON_DISCONNECTED, true);
+            if (autoBypass) {
+                if (metrics.state === 'DISCONNECTED' && !isTerminalProxyBypassed) {
+                    logger.log('Tunnel Watchdog: Auto-bypassing terminal proxy due to tunnel disconnection.', false);
+                    isTerminalProxyBypassed = true;
+                    if (context.environmentVariableCollection) {
+                        context.environmentVariableCollection.clear();
+                    }
+                    delete process.env.http_proxy;
+                    delete process.env.https_proxy;
+                    delete process.env.HTTP_PROXY;
+                    delete process.env.HTTPS_PROXY;
+                    delete process.env.all_proxy;
+                    delete process.env.ALL_PROXY;
+                } else if (metrics.state === 'HEALTHY' && isTerminalProxyBypassed) {
+                    logger.log('Tunnel Watchdog: Tunnel recovered; auto-restoring terminal proxy injection.', false);
+                    isTerminalProxyBypassed = false;
+                    const host = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
+                    const port = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
+                    const type = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
+                    const proxyUrl = `http://${host}:${port}`;
+                    const allProxyUrl = `${type}://${host}:${port}`;
+
+                    process.env.http_proxy = proxyUrl;
+                    process.env.https_proxy = proxyUrl;
+                    process.env.HTTP_PROXY = proxyUrl;
+                    process.env.HTTPS_PROXY = proxyUrl;
+                    process.env.all_proxy = allProxyUrl;
+                    process.env.ALL_PROXY = allProxyUrl;
+
+                    if (context.environmentVariableCollection) {
+                        context.environmentVariableCollection.replace('http_proxy', proxyUrl);
+                        context.environmentVariableCollection.replace('https_proxy', proxyUrl);
+                        context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
+                        context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
+                        context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
+                        context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
+                    }
+                }
+            }
+        }
         await refreshAllStatus();
     });
 
@@ -310,35 +402,68 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
     const remotePort = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
     const proxyType = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
 
-    // 1. Immediate Fast-Path Zero-Refusal Ingress Shield (T = 0ms):
-    // If primary port is completely unbound at startup, immediately bind IngressRelay (< 5ms)
-    // before any shell calls so early OAuth2 token refresh requests never hit ECONNREFUSED.
-    const initialPrimaryTcpOk = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 200);
-    if (!initialPrimaryTcpOk) {
-        await IngressRelay.getInstance().startRelay(
-            remotePort,
-            remotePort + 1,
-            [remotePort + 1, remotePort + 2, remotePort + 3]
-        );
-    } else {
-        const l7Check = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 500);
-        if (!l7Check.ok) {
-            logger.log(`Pre-emptive Ingress Guard: Primary port ${remotePort} failed L7 check, reclaiming zombie listener...`, false);
-            await Provisioner.reclaimPort(remotePort, remotePort);
-            const stillOccupied = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 150);
-            if (!stillOccupied) {
-                await IngressRelay.getInstance().startRelay(
-                    remotePort,
-                    remotePort + 1,
-                    [remotePort + 1, remotePort + 2, remotePort + 3]
-                );
+    // 1. Non-disruptive Readiness Probe:
+    // Allow an initial readiness window (~1200ms) for native SSH reverse port forwarding to bind,
+    // avoiding eager IngressRelay port collisions with incoming Remote-SSH sessions.
+    let nativeHealthy = false;
+    for (let attempt = 0; attempt < 4; attempt++) {
+        const primaryTcpOk = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 250);
+        if (primaryTcpOk) {
+            const l7Check = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 400);
+            if (l7Check.ok) {
+                nativeHealthy = true;
+                logger.log(`Native SSH reverse tunnel is healthy on ${remoteHost}:${remotePort}`, false);
+                break;
+            }
+        }
+        if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, 250));
+        }
+    }
+
+    if (!nativeHealthy) {
+        // If native port is occupied by a dead zombie listener, reclaim it
+        const primaryTcpOk = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 150);
+        if (primaryTcpOk) {
+            const l7Check = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 300);
+            if (!l7Check.ok) {
+                logger.log(`Pre-emptive Ingress Guard: Primary port ${remotePort} failed L7 check, reclaiming zombie listener...`, false);
+                await Provisioner.reclaimPort(remotePort, remotePort);
+            }
+        }
+
+        // Only start IngressRelay if a verified live fallback tunnel actually exists
+        // (e.g. from local Keeper or multi-port forward). Never blindly seize remotePort to point
+        // to dead fallback ports when no local tunnel exists at all.
+        const fallbackPorts = ALL_FALLBACK_PORT_OFFSETS.map(o => remotePort + o);
+        let liveFallbackPort: number | undefined;
+        for (const fp of fallbackPorts) {
+            const fpAvail = await TunnelManager.checkPortAvailable(remoteHost, fp, 200);
+            if (fpAvail) {
+                const fpL7 = await TunnelManager.checkProxyL7(remoteHost, fp, proxyType, 350);
+                if (fpL7.ok) {
+                    liveFallbackPort = fp;
+                    break;
+                }
+            }
+        }
+
+        if (liveFallbackPort) {
+            logger.log(`Activating IngressRelay: bridging port ${remotePort} -> live fallback port ${liveFallbackPort}`, false);
+            await IngressRelay.getInstance().startRelay(remotePort, liveFallbackPort, fallbackPorts);
+        } else {
+            logger.log(`No active fallback tunnels detected; keeping port ${remotePort} unblocked for incoming SSH forwards.`, false);
+            const autoBypass = config.get<boolean>(CFG_AUTO_BYPASS_TERMINAL_ON_DISCONNECTED, true);
+            if (autoBypass) {
+                isTerminalProxyBypassed = true;
+                logger.log('Cold start without active tunnel: deferred terminal proxy injection until tunnel is established.', false);
             }
         }
     }
 
-    // 2. Auto-inject terminal and extension-host proxy environment variables if enabled
+    // 2. Auto-inject terminal and extension-host proxy environment variables if enabled and not bypassed
     const autoInjectTerminal = config.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
-    if (autoInjectTerminal) {
+    if (autoInjectTerminal && !isTerminalProxyBypassed) {
         const proxyUrl = `http://${remoteHost}:${remotePort}`;
         const allProxyUrl = `${proxyType}://${remoteHost}:${remotePort}`;
         process.env.http_proxy = proxyUrl;

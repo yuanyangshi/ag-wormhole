@@ -14,6 +14,7 @@ export interface ProxyStatus {
     languageServerConfigured?: boolean;
     activeTunnelPort?: number;
     isRelaying?: boolean;
+    isTerminalProxyBypassed?: boolean;
 }
 
 export type StatusUpdateCallback = (status: ProxyStatus) => void;

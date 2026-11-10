@@ -388,12 +388,18 @@ _probe_proxy_l7() {
     local _h="$1"
     local _p="$2"
     if [ "$PROXY_TYPE" = "socks5" ]; then
-        timeout 0.8 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf '\x05\x01\x00' >&3 && IFS= read -r -t 0.6 -n 1 _c <&3" "$_h" "$_p" 2>/dev/null
-        return $?
+        if timeout 0.8 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf '\x05\x01\x00' >&3 && IFS= read -r -t 0.6 -n 1 _c <&3" "$_h" "$_p" 2>/dev/null; then
+            return 0
+        fi
     else
-        timeout 0.8 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 && IFS= read -r -t 0.6 _line <&3 && [ -n \"\$_line\" ]" "$_h" "$_p" 2>/dev/null
-        return $?
+        if timeout 0.8 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 && IFS= read -r -t 0.6 _line <&3 && [ -n \"\$_line\" ]" "$_h" "$_p" 2>/dev/null; then
+            return 0
+        fi
     fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import socket; s = socket.socket(); s.settimeout(0.6); s.connect(('$_h', int('$_p'))); s.sendall(b'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'); exit(0 if s.recv(16) else 1)" 2>/dev/null && return 0
+    fi
+    return 1
 }
 if command -v timeout >/dev/null 2>&1; then
     _PORT_READY=0
@@ -402,7 +408,7 @@ if command -v timeout >/dev/null 2>&1; then
             _PORT_READY=1
             break
         fi
-        for _OFFSET in 1 2 3; do
+        for _OFFSET in 1 2 3 4 5; do
             _CAND_PORT=$((WORMHOLE_PORT + _OFFSET))
             if _probe_proxy_l7 "${WORMHOLE_HOST}" "${_CAND_PORT}"; then
                 PROXY_ADDR="${WORMHOLE_HOST}:${_CAND_PORT}"
@@ -418,6 +424,12 @@ if command -v timeout >/dev/null 2>&1; then
         done
         sleep 0.25
     done
+fi
+
+if [ "$_PORT_READY" = "0" ]; then
+    echo "[AG-Wormhole][NOTICE] Ingress proxy endpoint ${PROXY_ADDR} unreachable after pre-flight probe; falling back to native direct execution." >&2
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+    exec "$SCRIPT_DIR/$SCRIPT_NAME.bak" "$@"
 fi
 
 if [ "$PROXY_TYPE" = "socks5" ]; then

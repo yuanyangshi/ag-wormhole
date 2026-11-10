@@ -20,6 +20,8 @@ export const CMD_SHOW_TRAFFIC = 'ag-wormhole.showTrafficPanel';
 export const CMD_RECLAIM_PORT = 'ag-wormhole.reclaimPort';
 export const CMD_OPTIMIZE_SSH = 'ag-wormhole.optimizeSSH';
 export const CMD_PURGE_CACHE = 'ag-wormhole.purgeCache';
+export const CMD_BYPASS_TERMINAL_PROXY = 'ag-wormhole.bypassTerminalProxy';
+export const CMD_RESTORE_TERMINAL_PROXY = 'ag-wormhole.restoreTerminalProxy';
 
 // Configuration Section & Keys
 export const CONFIG_SECTION = 'ag-wormhole';
@@ -32,6 +34,8 @@ export const CFG_PROXY_TYPE = 'proxyType';
 export const CFG_WATCHDOG_INTERVAL = 'watchdogInterval';
 export const CFG_AUTO_RECLAIM_PORT = 'autoReclaimPort';
 export const CFG_AUTO_INJECT_TERMINAL_PROXY = 'autoInjectTerminalProxy';
+export const CFG_AUTO_BYPASS_TERMINAL_ON_DISCONNECTED = 'autoBypassTerminalWhenDisconnected';
+export const CFG_SUPPRESS_UNREACHABLE_WARNING = 'suppressUnreachableWarning';
 
 // SSH Include Configuration
 export const WORMHOLE_SSH_CONFIG_FILENAME = 'config.wormhole';
@@ -51,4 +55,7 @@ export const DEFAULT_PROXY_PORT = 7890;
 export const DEFAULT_PROXY_TYPE = 'http';
 export const DEFAULT_WATCHDOG_INTERVAL_SEC = 10;
 export const AUTO_REFRESH_INTERVAL_SEC = 30;
+export const KEEPER_PORT_OFFSET = 3;
+export const MAIN_FALLBACK_PORT_OFFSETS = [1, 2, 4, 5];
+export const ALL_FALLBACK_PORT_OFFSETS = [1, 2, 3, 4, 5];
 

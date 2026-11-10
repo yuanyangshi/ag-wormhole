@@ -6,6 +6,7 @@
 
 import * as net from 'net';
 import { logger } from '../shared/logger';
+import { ALL_FALLBACK_PORT_OFFSETS } from '../shared/constants';
 
 export class IngressRelay {
     private static instance: IngressRelay;
@@ -178,7 +179,7 @@ export class IngressRelay {
             }
         }
         // Automatically include standard cluster fallback offsets relative to listenPort
-        for (let offset = 1; offset <= 3; offset++) {
+        for (const offset of ALL_FALLBACK_PORT_OFFSETS) {
             const fp = listenPort + offset;
             if (fp !== listenPort && fp > 0 && fp <= 65535) {
                 set.add(fp);
@@ -212,7 +213,7 @@ export class IngressRelay {
         if (candidates && candidates.length > 0) {
             this.candidatePorts = [...candidates];
         } else {
-            this.candidatePorts = [targetPort, listenPort + 1, listenPort + 2, listenPort + 3].filter(
+            this.candidatePorts = [targetPort, ...ALL_FALLBACK_PORT_OFFSETS.map(o => listenPort + o)].filter(
                 (p, idx, arr) => p !== listenPort && p > 0 && p <= 65535 && arr.indexOf(p) === idx
             );
         }

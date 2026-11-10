@@ -81,6 +81,14 @@
       {
         "command": "ag-wormhole.purgeCache",
         "title": "AG-Wormhole: Purge Cache & Clean Reinstall"
+      },
+      {
+        "command": "ag-wormhole.bypassTerminalProxy",
+        "title": "AG-Wormhole: Bypass Terminal Proxy (Switch to Direct Mode)"
+      },
+      {
+        "command": "ag-wormhole.restoreTerminalProxy",
+        "title": "AG-Wormhole: Restore Terminal Proxy Injection"
       }
     ],
     "configuration": {
@@ -116,6 +124,12 @@
           "scope": "machine-overridable",
           "description": "Show a status notification when connecting to a remote server."
         },
+        "ag-wormhole.suppressUnreachableWarning": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine-overridable",
+          "description": "Suppress popup notification when the proxy tunnel is unreachable (status bar icon will still reflect link health)."
+        },
         "ag-wormhole.watchdogInterval": {
           "type": "number",
           "default": 10,
@@ -135,6 +149,12 @@
           "default": true,
           "scope": "machine-overridable",
           "description": "Automatically inject proxy environment variables (http_proxy, https_proxy, all_proxy) into remote integrated terminals."
+        },
+        "ag-wormhole.autoBypassTerminalWhenDisconnected": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine-overridable",
+          "description": "Automatically bypass proxy environment variables in remote terminals when the tunnel is disconnected, and restore them when the tunnel recovers."
         },
         "ag-wormhole.proxyType": {
           "type": "string",
