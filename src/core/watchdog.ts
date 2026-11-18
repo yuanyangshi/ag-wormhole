@@ -50,12 +50,14 @@ export interface IDisposable {
 export class TunnelWatchdog {
     private static instance: TunnelWatchdog;
     private timer?: NodeJS.Timeout;
+    private fastConfirmTimer?: NodeJS.Timeout;
     private fastPathTimers: NodeJS.Timeout[] = [];
     private metrics: WatchdogMetrics;
     private stateChangeCallbacks: ((metrics: WatchdogMetrics) => void)[] = [];
     private isProbing = false;
     private isMutedForSession = false;
     private probeCount = 0;
+    private fastConfirmRetries = 0;
     private checkIntervalMs = 10000; // default 10s non-intrusive probe
     private readonly fastRecoveryIntervalMs = 2500; // 2.5s fast-path self-healing probe
     private readonly backoffIntervalMs = 30000; // 30s smart backoff probe during prolonged outages
@@ -133,10 +135,28 @@ export class TunnelWatchdog {
             clearInterval(this.timer);
             this.timer = undefined;
         }
+        if (this.fastConfirmTimer) {
+            clearTimeout(this.fastConfirmTimer);
+            this.fastConfirmTimer = undefined;
+        }
         for (const ft of this.fastPathTimers) {
             clearTimeout(ft);
         }
         this.fastPathTimers = [];
+        this.fastConfirmRetries = 0;
+    }
+
+    private scheduleFastConfirm(): void {
+        if (this.fastConfirmTimer) {
+            clearTimeout(this.fastConfirmTimer);
+        }
+        this.fastConfirmTimer = setTimeout(() => {
+            this.fastConfirmTimer = undefined;
+            this.probe();
+        }, 1200);
+        if (typeof this.fastConfirmTimer.unref === 'function') {
+            this.fastConfirmTimer.unref();
+        }
     }
 
     public muteSession(): void {
@@ -234,6 +254,10 @@ export class TunnelWatchdog {
                 }
             }
 
+            if (isReachable && l7Result?.ok) {
+                this.fastConfirmRetries = 0;
+            }
+
             // Autonomous Reconnect Recovery:
             // If primary remote port is unavailable (or held by a dead zombie sshd from a previous session
             // while a new sshd bound to one of the fallback ports), bridge traffic via IngressRelay.
@@ -269,6 +293,7 @@ export class TunnelWatchdog {
                                 l7Result = { ok: true, message: `Relayed via active tunnel port ${fp}` };
                                 this.metrics.activeTunnelPort = fp;
                                 this.metrics.isRelaying = true;
+                                this.fastConfirmRetries = 0;
                                 recoveredViaFallback = true;
                                 break;
                             } else {
@@ -278,6 +303,7 @@ export class TunnelWatchdog {
                                     l7Result = { ok: true, message: `Relayed via active tunnel port ${fp}` };
                                     this.metrics.activeTunnelPort = fp;
                                     this.metrics.isRelaying = true;
+                                    this.fastConfirmRetries = 0;
                                     recoveredViaFallback = true;
                                     break;
                                 } else {
@@ -287,9 +313,14 @@ export class TunnelWatchdog {
                                     if (primaryRecheck.ok) {
                                         l7Result = primaryRecheck;
                                         this.metrics.activeTunnelPort = remotePort;
+                                        this.fastConfirmRetries = 0;
                                     } else {
                                         l7Result = { ok: true, message: `Active tunnel verified on fallback port ${fp}` };
                                         this.metrics.activeTunnelPort = fp;
+                                        this.fastConfirmRetries++;
+                                        if (this.fastConfirmRetries <= 3) {
+                                            this.scheduleFastConfirm();
+                                        }
                                     }
                                     this.metrics.isRelaying = false;
                                     recoveredViaFallback = true;
@@ -302,14 +333,15 @@ export class TunnelWatchdog {
 
                 // If no fallback port is healthy, never blindly seize remotePort into a dead loop.
                 // Instead, stop any existing dead relay to keep remotePort completely unblocked
-                // for native incoming SSH reverse port forwards.
+                // for native incoming SSH reverse port forwards. Port reclamation is handled
+                // by handleTunnelDisconnection once failureThreshold is reached.
                 if (!recoveredViaFallback) {
+                    this.fastConfirmRetries = 0;
                     if (wasRelaying) {
                         logger.log(`Tunnel Watchdog: All fallback ports offline. Releasing IngressRelay on port ${remotePort}...`, false);
                         await IngressRelay.getInstance().stopRelay();
                         this.metrics.isRelaying = false;
                     }
-                    await Provisioner.reclaimPort(remotePort, remotePort);
                 }
             }
 
@@ -335,6 +367,10 @@ export class TunnelWatchdog {
 
                 if (prevState !== 'HEALTHY') {
                     this.scheduleNextProbe();
+                }
+                if (this.fastConfirmTimer) {
+                    clearTimeout(this.fastConfirmTimer);
+                    this.fastConfirmTimer = undefined;
                 }
 
                 if (isRunningLocally()) {
@@ -374,6 +410,9 @@ export class TunnelWatchdog {
                 if (prevState === 'HEALTHY' || isFirstProlonged) {
                     this.scheduleNextProbe();
                 }
+                if (prevState === 'HEALTHY' && this.metrics.state === 'DEGRADED') {
+                    this.scheduleFastConfirm();
+                }
                 logger.log(`Tunnel Watchdog: Port open but L7 proxy probe degraded: ${this.metrics.l7Message}`, isRunningLocally());
             } else {
                 this.metrics.l7Health = false;
@@ -391,6 +430,9 @@ export class TunnelWatchdog {
                 }
                 if (prevState === 'HEALTHY' || isFirstProlonged) {
                     this.scheduleNextProbe();
+                }
+                if (prevState === 'HEALTHY' && this.metrics.state === 'DEGRADED') {
+                    this.scheduleFastConfirm();
                 }
                 logger.log(
                     `Tunnel Watchdog probe failed (consecutive failures: ${this.metrics.consecutiveFailures})`,

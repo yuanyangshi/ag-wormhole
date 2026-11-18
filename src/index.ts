@@ -51,7 +51,56 @@ import { TunnelWatchdog } from './core/watchdog';
 let statusBar: StatusBarController;
 let trafficCollector: TrafficCollector;
 let autoRefreshTimer: NodeJS.Timeout | undefined;
-let isTerminalProxyBypassed = false;
+let isManualProxyBypassed = false;
+let isAutoProxyBypassed = false;
+let lastAppliedProxySignature = '';
+
+const isTerminalProxyEffectivelyBypassed = (): boolean => isManualProxyBypassed || isAutoProxyBypassed;
+
+function applyRemoteProxyEnvironment(
+    context: vscode.ExtensionContext,
+    host: string,
+    port: number,
+    proxyType: string
+): void {
+    const proxyUrl = `http://${host}:${port}`;
+    const allProxyUrl = `${proxyType}://${host}:${port}`;
+    const noProxy = process.env.no_proxy || process.env.NO_PROXY || 'localhost,127.0.0.1,::1';
+
+    process.env.http_proxy = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.all_proxy = allProxyUrl;
+    process.env.ALL_PROXY = allProxyUrl;
+    process.env.no_proxy = noProxy;
+    process.env.NO_PROXY = noProxy;
+
+    if (context.environmentVariableCollection) {
+        context.environmentVariableCollection.replace('http_proxy', proxyUrl);
+        context.environmentVariableCollection.replace('https_proxy', proxyUrl);
+        context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
+        context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
+        context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
+        context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
+        context.environmentVariableCollection.replace('no_proxy', noProxy);
+        context.environmentVariableCollection.replace('NO_PROXY', noProxy);
+    }
+    lastAppliedProxySignature = `${proxyType}://${host}:${port}`;
+}
+
+function clearRemoteProxyEnvironment(context: vscode.ExtensionContext): void {
+    if (context.environmentVariableCollection) {
+        context.environmentVariableCollection.clear();
+    }
+    delete process.env.http_proxy;
+    delete process.env.https_proxy;
+    delete process.env.HTTP_PROXY;
+    delete process.env.HTTPS_PROXY;
+    delete process.env.all_proxy;
+    delete process.env.ALL_PROXY;
+    lastAppliedProxySignature = '';
+}
 
 let currentStatus: ProxyStatus = {
     runningLocation: 'local',
@@ -108,7 +157,7 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
             languageServerConfigured: Boolean(lsProcess?.isUsingProxy || isMgraftcpRunning || isAgyConfigured),
             activeTunnelPort: watchdogMetrics.activeTunnelPort || remotePort,
             isRelaying: watchdogMetrics.isRelaying,
-            isTerminalProxyBypassed: isTerminalProxyBypassed,
+            isTerminalProxyBypassed: isTerminalProxyEffectivelyBypassed(),
             lastUpdated: new Date()
         };
     }
@@ -211,91 +260,52 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }),
 
         vscode.commands.registerCommand(CMD_BYPASS_TERMINAL_PROXY, async () => {
-            isTerminalProxyBypassed = true;
-            if (context.environmentVariableCollection) {
-                context.environmentVariableCollection.clear();
-            }
-            delete process.env.http_proxy;
-            delete process.env.https_proxy;
-            delete process.env.HTTP_PROXY;
-            delete process.env.HTTPS_PROXY;
-            delete process.env.all_proxy;
-            delete process.env.ALL_PROXY;
+            isManualProxyBypassed = true;
+            clearRemoteProxyEnvironment(context);
             await refreshAllStatus();
             vscode.window.showInformationMessage('[AG-Wormhole] Switched to Direct Mode. Proxy environment variables cleared from remote terminals.');
         }),
 
         vscode.commands.registerCommand(CMD_RESTORE_TERMINAL_PROXY, async () => {
-            isTerminalProxyBypassed = false;
+            isManualProxyBypassed = false;
+            isAutoProxyBypassed = false;
             const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
             const host = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
             const port = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
             const type = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
-            const proxyUrl = `http://${host}:${port}`;
-            const allProxyUrl = `${type}://${host}:${port}`;
-
-            process.env.http_proxy = proxyUrl;
-            process.env.https_proxy = proxyUrl;
-            process.env.HTTP_PROXY = proxyUrl;
-            process.env.HTTPS_PROXY = proxyUrl;
-            process.env.all_proxy = allProxyUrl;
-            process.env.ALL_PROXY = allProxyUrl;
-
-            if (context.environmentVariableCollection) {
-                context.environmentVariableCollection.replace('http_proxy', proxyUrl);
-                context.environmentVariableCollection.replace('https_proxy', proxyUrl);
-                context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
-                context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
-                context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
-                context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
-            }
+            applyRemoteProxyEnvironment(context, host, port, type);
             await refreshAllStatus();
-            vscode.window.showInformationMessage(`[AG-Wormhole] Restored terminal proxy injection (${proxyUrl}).`);
+            vscode.window.showInformationMessage(`[AG-Wormhole] Restored terminal proxy injection (http://${host}:${port}).`);
         })
     );
 
     const watchdog = TunnelWatchdog.getInstance();
     context.subscriptions.push(new vscode.Disposable(() => watchdog.stop()));
     watchdog.onStateChange(async (metrics) => {
-        if (isRunningRemotely()) {
+        if (isRunningRemotely() && !isManualProxyBypassed) {
             const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
             const autoBypass = config.get<boolean>(CFG_AUTO_BYPASS_TERMINAL_ON_DISCONNECTED, true);
-            if (autoBypass) {
-                if (metrics.state === 'DISCONNECTED' && !isTerminalProxyBypassed) {
-                    logger.log('Tunnel Watchdog: Auto-bypassing terminal proxy due to tunnel disconnection.', false);
-                    isTerminalProxyBypassed = true;
-                    if (context.environmentVariableCollection) {
-                        context.environmentVariableCollection.clear();
+            const autoInject = config.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
+            const host = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
+            const port = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
+            const type = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
+
+            if (autoBypass && metrics.state === 'DISCONNECTED' && metrics.consecutiveFailures >= 3 && !isAutoProxyBypassed) {
+                logger.log('Tunnel Watchdog: Auto-bypassing terminal proxy due to tunnel disconnection.', false);
+                isAutoProxyBypassed = true;
+                clearRemoteProxyEnvironment(context);
+            } else if (metrics.state === 'HEALTHY') {
+                const effectivePort = (!metrics.isRelaying && metrics.activeTunnelPort)
+                    ? metrics.activeTunnelPort
+                    : port;
+                const targetSig = `${type}://${host}:${effectivePort}`;
+                if (isAutoProxyBypassed || (autoInject && lastAppliedProxySignature !== targetSig)) {
+                    if (isAutoProxyBypassed) {
+                        logger.log('Tunnel Watchdog: Tunnel recovered; auto-restoring terminal proxy injection.', false);
                     }
-                    delete process.env.http_proxy;
-                    delete process.env.https_proxy;
-                    delete process.env.HTTP_PROXY;
-                    delete process.env.HTTPS_PROXY;
-                    delete process.env.all_proxy;
-                    delete process.env.ALL_PROXY;
-                } else if (metrics.state === 'HEALTHY' && isTerminalProxyBypassed) {
-                    logger.log('Tunnel Watchdog: Tunnel recovered; auto-restoring terminal proxy injection.', false);
-                    isTerminalProxyBypassed = false;
-                    const host = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
-                    const port = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
-                    const type = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
-                    const proxyUrl = `http://${host}:${port}`;
-                    const allProxyUrl = `${type}://${host}:${port}`;
-
-                    process.env.http_proxy = proxyUrl;
-                    process.env.https_proxy = proxyUrl;
-                    process.env.HTTP_PROXY = proxyUrl;
-                    process.env.HTTPS_PROXY = proxyUrl;
-                    process.env.all_proxy = allProxyUrl;
-                    process.env.ALL_PROXY = allProxyUrl;
-
-                    if (context.environmentVariableCollection) {
-                        context.environmentVariableCollection.replace('http_proxy', proxyUrl);
-                        context.environmentVariableCollection.replace('https_proxy', proxyUrl);
-                        context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
-                        context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
-                        context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
-                        context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
+                    isAutoProxyBypassed = false;
+                    if (autoInject) {
+                        applyRemoteProxyEnvironment(context, host, effectivePort, type);
                     }
                 }
             }
@@ -406,6 +416,7 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
     // Allow an initial readiness window (~1200ms) for native SSH reverse port forwarding to bind,
     // avoiding eager IngressRelay port collisions with incoming Remote-SSH sessions.
     let nativeHealthy = false;
+    let liveFallbackPort: number | undefined;
     for (let attempt = 0; attempt < 4; attempt++) {
         const primaryTcpOk = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 250);
         if (primaryTcpOk) {
@@ -436,7 +447,6 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
         // (e.g. from local Keeper or multi-port forward). Never blindly seize remotePort to point
         // to dead fallback ports when no local tunnel exists at all.
         const fallbackPorts = ALL_FALLBACK_PORT_OFFSETS.map(o => remotePort + o);
-        let liveFallbackPort: number | undefined;
         for (const fp of fallbackPorts) {
             const fpAvail = await TunnelManager.checkPortAvailable(remoteHost, fp, 200);
             if (fpAvail) {
@@ -455,7 +465,7 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
             logger.log(`No active fallback tunnels detected; keeping port ${remotePort} unblocked for incoming SSH forwards.`, false);
             const autoBypass = config.get<boolean>(CFG_AUTO_BYPASS_TERMINAL_ON_DISCONNECTED, true);
             if (autoBypass) {
-                isTerminalProxyBypassed = true;
+                isAutoProxyBypassed = true;
                 logger.log('Cold start without active tunnel: deferred terminal proxy injection until tunnel is established.', false);
             }
         }
@@ -463,28 +473,12 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
 
     // 2. Auto-inject terminal and extension-host proxy environment variables if enabled and not bypassed
     const autoInjectTerminal = config.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
-    if (autoInjectTerminal && !isTerminalProxyBypassed) {
-        const proxyUrl = `http://${remoteHost}:${remotePort}`;
-        const allProxyUrl = `${proxyType}://${remoteHost}:${remotePort}`;
-        process.env.http_proxy = proxyUrl;
-        process.env.https_proxy = proxyUrl;
-        process.env.HTTP_PROXY = proxyUrl;
-        process.env.HTTPS_PROXY = proxyUrl;
-        process.env.all_proxy = allProxyUrl;
-        process.env.ALL_PROXY = allProxyUrl;
-        if (!process.env.no_proxy && !process.env.NO_PROXY) {
-            process.env.no_proxy = 'localhost,127.0.0.1,::1';
-            process.env.NO_PROXY = 'localhost,127.0.0.1,::1';
-        }
-        if (context.environmentVariableCollection) {
-            context.environmentVariableCollection.replace('http_proxy', proxyUrl);
-            context.environmentVariableCollection.replace('https_proxy', proxyUrl);
-            context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
-            context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
-            context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
-            context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
-            logger.log(`Injected proxy environment variables into remote terminals: ${proxyUrl}`, false);
-        }
+    if (autoInjectTerminal && !isTerminalProxyEffectivelyBypassed()) {
+        const effectiveRemotePort = (!nativeHealthy && !IngressRelay.getInstance().isRelaying() && liveFallbackPort)
+            ? liveFallbackPort
+            : remotePort;
+        applyRemoteProxyEnvironment(context, remoteHost, effectiveRemotePort, proxyType);
+        logger.log(`Injected proxy environment variables into remote terminals: http://${remoteHost}:${effectiveRemotePort}`, false);
     }
 
     await Provisioner.ensureExecutablePermissions(extensionPath);
@@ -524,17 +518,10 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
                 const p = cfg.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
                 const t = cfg.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
                 const inject = cfg.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
-                if (inject && context.environmentVariableCollection) {
-                    const proxyUrl = `http://${h}:${p}`;
-                    const allProxyUrl = `${t}://${h}:${p}`;
-                    context.environmentVariableCollection.replace('http_proxy', proxyUrl);
-                    context.environmentVariableCollection.replace('https_proxy', proxyUrl);
-                    context.environmentVariableCollection.replace('HTTP_PROXY', proxyUrl);
-                    context.environmentVariableCollection.replace('HTTPS_PROXY', proxyUrl);
-                    context.environmentVariableCollection.replace('all_proxy', allProxyUrl);
-                    context.environmentVariableCollection.replace('ALL_PROXY', allProxyUrl);
-                } else if (!inject && context.environmentVariableCollection) {
-                    context.environmentVariableCollection.clear();
+                if (!inject) {
+                    clearRemoteProxyEnvironment(context);
+                } else if (!isTerminalProxyEffectivelyBypassed()) {
+                    applyRemoteProxyEnvironment(context, h, p, t);
                 }
                 await Provisioner.runSetupSilently(h, p, t, extensionPath);
                 await refreshAllStatus();
@@ -574,7 +561,7 @@ export async function deactivate(): Promise<void> {
     }
     TunnelWatchdog.getInstance().stop();
     if (isRunningLocally()) {
-        await TunnelManager.stopAllKeepers();
+        await TunnelManager.stopKeepersIfIdle();
     }
     await IngressRelay.getInstance().stopRelay();
     trafficCollector?.stop();

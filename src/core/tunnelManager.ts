@@ -4,7 +4,7 @@
  */
 
 import * as net from 'net';
-import { exec, spawn, ChildProcess } from 'child_process';
+import { exec, execFile, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { SSHConfigManager } from './sshConfigManager';
 import { logger } from '../shared/logger';
@@ -18,12 +18,17 @@ import {
 } from '../shared/constants';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export class TunnelManager {
     private static isSyncingKeepers = false;
     private static lastKeeperSyncMs = 0;
     private static localUnreachableWarned = false;
     private static activeKeeperChildren = new Map<string, ChildProcess>();
+    private static activeKeeperPids = new Map<string, number>();
+    private static keeperRetryCounts = new Map<string, number>();
+    private static keeperRetryTimers = new Map<string, NodeJS.Timeout>();
+    private static isShuttingDownKeepers = false;
     /**
      * Test TCP connectivity to specified endpoint
      */
@@ -285,8 +290,11 @@ export class TunnelManager {
             if (token.startsWith('-')) {
                 continue;
             }
-            if (/^[a-zA-Z0-9._@-]+$/.test(token) && token !== 'localhost' && token !== '127.0.0.1') {
-                const lowerHost = token.toLowerCase();
+            const normalizedToken = token.startsWith('ssh://')
+                ? token.slice('ssh://'.length).split('/')[0].split(':')[0]
+                : token;
+            if (/^[a-zA-Z0-9._@:-]+$/.test(normalizedToken) && normalizedToken !== 'localhost' && normalizedToken !== '127.0.0.1') {
+                const lowerHost = normalizedToken.toLowerCase();
                 // Ignore Git SSH operations (e.g. git@github.com, git-upload-pack) and file transfer utilities
                 if (
                     lowerHost.startsWith('git@') ||
@@ -298,7 +306,7 @@ export class TunnelManager {
                 if (/\b(git-upload-pack|git-receive-pack|git-lfs-authenticate|scp|sftp)\b/.test(trailingCmd)) {
                     return null;
                 }
-                return { host: token, isKeeper };
+                return { host: normalizedToken, isKeeper };
             }
             break;
         }
@@ -312,20 +320,23 @@ export class TunnelManager {
     public static async discoverActiveSshSessions(): Promise<{
         interactiveHosts: string[];
         keeperPidsByHost: Map<string, number[]>;
+        scanSucceeded: boolean;
     }> {
         const interactiveHosts = new Set<string>();
         const keeperPidsByHost = new Map<string, number[]>();
+        let scanSucceeded = false;
 
         try {
             let stdout = '';
             if (process.platform === 'win32') {
                 const psCmd = 'powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\"Name = \'ssh.exe\'\\" | ForEach-Object { \\"$($_.ProcessId)`t$($_.CommandLine)\\" }"';
-                const res = await execAsync(psCmd, { timeout: 4000, windowsHide: true });
+                const res = await execAsync(psCmd, { timeout: 6000, windowsHide: true });
                 stdout = res.stdout;
             } else {
                 const res = await execAsync('ps -eo pid=,args= | grep -E "[s]sh " || true', { timeout: 3000 });
                 stdout = res.stdout;
             }
+            scanSucceeded = true;
 
             const lines = stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
             for (const line of lines) {
@@ -358,8 +369,89 @@ export class TunnelManager {
 
         return {
             interactiveHosts: Array.from(interactiveHosts),
-            keeperPidsByHost
+            keeperPidsByHost,
+            scanSucceeded
         };
+    }
+
+    private static isPidAlive(pid: number): boolean {
+        if (!pid || pid <= 0) {
+            return false;
+        }
+        try {
+            process.kill(pid, 0);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Quote a single Windows command-line argument for CreateProcess / Win32_Process.Create
+     */
+    public static quoteWindowsCommandArg(arg: string): string {
+        if (!arg) {
+            return '""';
+        }
+        if (!/[\s"&|<>^()]/.test(arg)) {
+            return arg;
+        }
+        return `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`;
+    }
+
+    /**
+     * Spawn a truly detached, windowless background SSH keeper on Windows via WMI Win32_Process.Create
+     * (with ShowWindow = 0) so it runs outside the IDE's process tree and Job Object and survives
+     * when the spawning IDE window closes, without allocating a visible console window.
+     */
+    private static async spawnDetachedKeeperWindows(sshExe: string, args: string[]): Promise<number | null> {
+        const commandLine = [sshExe, ...args].map(TunnelManager.quoteWindowsCommandArg).join(' ');
+        const escapedForPsSingleQuote = commandLine.replace(/'/g, "''");
+        const psScript = [
+            "$ErrorActionPreference = 'Stop'",
+            "$s = ([wmiclass]'Win32_ProcessStartup').CreateInstance()",
+            '$s.ShowWindow = 0',
+            `$r = ([wmiclass]'Win32_Process').Create('${escapedForPsSingleQuote}', $null, $s)`,
+            'if ($r.ReturnValue -eq 0 -and $r.ProcessId -gt 0) { Write-Output $r.ProcessId } else { exit 1 }'
+        ].join('; ');
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+
+        try {
+            const { stdout } = await execFileAsync(
+                'powershell.exe',
+                ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                { timeout: 5000, windowsHide: true }
+            );
+            const pid = parseInt(stdout.trim(), 10);
+            if (!isNaN(pid) && pid > 0) {
+                return pid;
+            }
+        } catch {
+            // Fall through to Start-Process fallback
+        }
+
+        try {
+            const psArgsLiteral = args.map(a => `'${a.replace(/'/g, "''")}'`).join(', ');
+            const fallbackScript = [
+                "$ErrorActionPreference = 'Stop'",
+                `$p = Start-Process -FilePath '${sshExe.replace(/'/g, "''")}' -ArgumentList @(${psArgsLiteral}) -WindowStyle Hidden -PassThru`,
+                'Write-Output $p.Id'
+            ].join('; ');
+            const fallbackEncoded = Buffer.from(fallbackScript, 'utf16le').toString('base64');
+            const { stdout } = await execFileAsync(
+                'powershell.exe',
+                ['-NoProfile', '-NonInteractive', '-EncodedCommand', fallbackEncoded],
+                { timeout: 5000, windowsHide: true }
+            );
+            const pid = parseInt(stdout.trim(), 10);
+            if (!isNaN(pid) && pid > 0) {
+                return pid;
+            }
+        } catch {
+            // Fall through to standard spawn fallback
+        }
+
+        return null;
     }
 
     private static async terminateKeeperProcess(pid: number): Promise<void> {
@@ -375,8 +467,9 @@ export class TunnelManager {
     }
 
     /**
-     * Strip wormhole includes and conflicting forwarding directives from a raw SSH config
-     * so the dedicated background keeper process only binds its assigned keeper port (remotePort + 3).
+     * Strip wormhole includes and conflicting forwarding/multiplexing directives from a raw SSH config
+     * so the dedicated background keeper process only binds its assigned keeper port (remotePort + 3)
+     * in an isolated connection.
      */
     public static sanitizeKeeperSshConfig(rawConfig: string): string {
         return rawConfig
@@ -389,7 +482,7 @@ export class TunnelManager {
                 if (line.includes('config.wormhole')) {
                     return false;
                 }
-                if (/^(RemoteForward|ClearAllForwardings|ExitOnForwardFailure)\b/i.test(trimmed)) {
+                if (/^(RemoteForward|LocalForward|DynamicForward|ClearAllForwardings|ExitOnForwardFailure|ControlMaster|ControlPath|ControlPersist)\b/i.test(trimmed)) {
                     return false;
                 }
                 return true;
@@ -412,14 +505,27 @@ export class TunnelManager {
             return;
         }
         const now = Date.now();
+        let hadDeadTrackedPid = false;
+        for (const [h, pid] of TunnelManager.activeKeeperPids.entries()) {
+            if (!TunnelManager.isPidAlive(pid)) {
+                TunnelManager.activeKeeperPids.delete(h);
+                hadDeadTrackedPid = true;
+            }
+        }
         // Fast-path: if we already have live in-memory tracked keeper child process(es),
-        // avoid spawning PowerShell/ps unless 5 minutes have elapsed or force=true.
-        const hasLiveTrackedKeepers =
+        // avoid spawning PowerShell/ps too frequently while still discovering newly opened hosts promptly.
+        const hasLiveTrackedChildren =
             TunnelManager.activeKeeperChildren.size > 0 &&
             Array.from(TunnelManager.activeKeeperChildren.values()).every(
                 (c) => c.exitCode === null && !c.killed
             );
-        const minIntervalMs = hasLiveTrackedKeepers ? 300000 : 120000;
+        const hasLiveTrackedPids =
+            TunnelManager.activeKeeperPids.size > 0 &&
+            Array.from(TunnelManager.activeKeeperPids.values()).every(
+                (pid) => TunnelManager.isPidAlive(pid)
+            );
+        const hasLiveTrackedKeepers = hasLiveTrackedChildren || hasLiveTrackedPids;
+        const minIntervalMs = hadDeadTrackedPid ? 5000 : (hasLiveTrackedKeepers ? 60000 : 20000);
         if (!force && enabled && now - TunnelManager.lastKeeperSyncMs < minIntervalMs) {
             return;
         }
@@ -427,7 +533,7 @@ export class TunnelManager {
         TunnelManager.lastKeeperSyncMs = now;
 
         try {
-            const { interactiveHosts, keeperPidsByHost } = await TunnelManager.discoverActiveSshSessions();
+            const { interactiveHosts, keeperPidsByHost, scanSucceeded } = await TunnelManager.discoverActiveSshSessions();
 
             if (!enabled) {
                 await TunnelManager.stopAllKeepers();
@@ -436,6 +542,11 @@ export class TunnelManager {
                         await TunnelManager.terminateKeeperProcess(pid);
                     }
                 }
+                return;
+            }
+
+            if (!scanSucceeded) {
+                logger.log('Skipping keeper reconciliation: SSH process scan timed out or failed.', true);
                 return;
             }
 
@@ -450,6 +561,11 @@ export class TunnelManager {
                             // Ignore
                         }
                         TunnelManager.activeKeeperChildren.delete(host);
+                    }
+                    const trackedPid = TunnelManager.activeKeeperPids.get(host);
+                    if (trackedPid) {
+                        TunnelManager.activeKeeperPids.delete(host);
+                        await TunnelManager.terminateKeeperProcess(trackedPid);
                     }
                     for (const pid of pids) {
                         await TunnelManager.terminateKeeperProcess(pid);
@@ -476,8 +592,16 @@ export class TunnelManager {
             for (const host of interactiveHosts) {
                 const existingKeepers = keeperPidsByHost.get(host) || [];
                 const trackedChild = TunnelManager.activeKeeperChildren.get(host);
-                if (existingKeepers.length > 0 || (trackedChild && trackedChild.exitCode === null && !trackedChild.killed)) {
+                const trackedPid = TunnelManager.activeKeeperPids.get(host);
+                if (
+                    existingKeepers.length > 0 ||
+                    (trackedChild && trackedChild.exitCode === null && !trackedChild.killed) ||
+                    (trackedPid && TunnelManager.isPidAlive(trackedPid))
+                ) {
                     continue;
+                }
+                if (trackedPid) {
+                    TunnelManager.activeKeeperPids.delete(host);
                 }
 
                 try {
@@ -495,7 +619,9 @@ export class TunnelManager {
                             const rawMain = fs.readFileSync(mainConfig, 'utf-8') as string;
                             const keeperCfgContent = TunnelManager.sanitizeKeeperSshConfig(rawMain);
                             const keeperCfgPath = path.join(sshDir, 'config.wormhole.keeper');
-                            fs.writeFileSync(keeperCfgPath, keeperCfgContent, 'utf-8');
+                            const keeperCfgTmpPath = `${keeperCfgPath}.${process.pid}.tmp`;
+                            fs.writeFileSync(keeperCfgTmpPath, keeperCfgContent, 'utf-8');
+                            fs.renameSync(keeperCfgTmpPath, keeperCfgPath);
                             configParam = ['-F', keeperCfgPath];
                         }
                     } catch {
@@ -507,6 +633,9 @@ export class TunnelManager {
                         '-N',
                         '-T',
                         '-o', 'BatchMode=yes',
+                        '-o', 'ControlMaster=no',
+                        '-o', 'ControlPath=none',
+                        '-o', 'ControlPersist=no',
                         '-o', 'ExitOnForwardFailure=yes',
                         '-o', 'ServerAliveInterval=15',
                         '-o', 'ServerAliveCountMax=3',
@@ -519,28 +648,50 @@ export class TunnelManager {
                         host
                     ];
 
-                    // On Windows, use detached: false + windowsHide: true so CreateProcessW sets CREATE_NO_WINDOW
-                    // rather than DETACHED_PROCESS. This prevents child processes (such as `Match ... exec "cmd.exe ..."`
-                    // in ~/.ssh/config) from allocating a visible console window on the desktop.
                     const sshExe = process.platform === 'win32' ? 'ssh.exe' : 'ssh';
+                    TunnelManager.isShuttingDownKeepers = false;
+
+                    if (process.platform === 'win32') {
+                        const detachedPid = await TunnelManager.spawnDetachedKeeperWindows(sshExe, args);
+                        if (detachedPid !== null) {
+                            TunnelManager.activeKeeperPids.set(host, detachedPid);
+                            TunnelManager.keeperRetryCounts.set(host, 0);
+                            logger.log(
+                                `Spawned detached HA tunnel keeper (PID ${detachedPid}) for remote host '${host}' (port ${remotePort + 3} -> 127.0.0.1:${localPort})`,
+                                true
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Non-Windows (or Windows fallback if WMI/Start-Process unavailable)
                     const child = spawn(sshExe, args, {
                         detached: process.platform !== 'win32',
                         stdio: 'ignore',
                         windowsHide: true
                     });
                     TunnelManager.activeKeeperChildren.set(host, child);
+                    const spawnedAt = Date.now();
                     const cleanupChild = () => {
                         if (TunnelManager.activeKeeperChildren.get(host) === child) {
                             TunnelManager.activeKeeperChildren.delete(host);
                         }
                         child.removeAllListeners();
+                        if (!TunnelManager.isShuttingDownKeepers) {
+                            // Reset retry backoff if keeper stayed alive for at least 30 seconds
+                            if (Date.now() - spawnedAt >= 30000) {
+                                TunnelManager.keeperRetryCounts.set(host, 0);
+                            }
+                            TunnelManager.lastKeeperSyncMs = 0;
+                            TunnelManager.scheduleKeeperReconnect(host, localPort, remotePort);
+                        }
                     };
                     child.once('exit', cleanupChild);
                     child.once('error', cleanupChild);
                     child.unref();
 
                     logger.log(
-                        `Spawned autonomous HA tunnel keeper for remote host '${host}' (ports ${remotePort}, ${remotePort + 3} -> 127.0.0.1:${localPort})`,
+                        `Spawned autonomous HA tunnel keeper for remote host '${host}' (port ${remotePort + 3} -> 127.0.0.1:${localPort})`,
                         true
                     );
                 } catch (err) {
@@ -553,9 +704,40 @@ export class TunnelManager {
     }
 
     /**
+     * Schedule an exponential-backoff reconnect for an unexpectedly exited keeper process
+     */
+    private static scheduleKeeperReconnect(host: string, localPort: number, remotePort: number): void {
+        const existingTimer = TunnelManager.keeperRetryTimers.get(host);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+        }
+        const attempts = TunnelManager.keeperRetryCounts.get(host) ?? 0;
+        const baseDelayMs = Math.min(30000, 1000 * Math.pow(2, Math.min(attempts, 5)));
+        const jitterMs = Math.floor(Math.random() * 500);
+        TunnelManager.keeperRetryCounts.set(host, attempts + 1);
+
+        const timer = setTimeout(() => {
+            TunnelManager.keeperRetryTimers.delete(host);
+            if (!TunnelManager.isShuttingDownKeepers) {
+                TunnelManager.ensureBackgroundTunnelKeepers(localPort, remotePort, true, true).catch(() => {});
+            }
+        }, baseDelayMs + jitterMs);
+        if (typeof timer.unref === 'function') {
+            timer.unref();
+        }
+        TunnelManager.keeperRetryTimers.set(host, timer);
+    }
+
+    /**
      * Cleanly terminate all in-memory tracked keeper child processes on shutdown
      */
     public static async stopAllKeepers(): Promise<void> {
+        TunnelManager.isShuttingDownKeepers = true;
+        for (const [host, timer] of TunnelManager.keeperRetryTimers.entries()) {
+            clearTimeout(timer);
+            TunnelManager.keeperRetryTimers.delete(host);
+        }
+        TunnelManager.keeperRetryCounts.clear();
         for (const [host, child] of TunnelManager.activeKeeperChildren.entries()) {
             try {
                 child.removeAllListeners();
@@ -567,6 +749,40 @@ export class TunnelManager {
             }
             TunnelManager.activeKeeperChildren.delete(host);
         }
+        for (const [host, pid] of TunnelManager.activeKeeperPids.entries()) {
+            TunnelManager.activeKeeperPids.delete(host);
+            await TunnelManager.terminateKeeperProcess(pid);
+        }
+    }
+
+    /**
+     * On window deactivation, preserve background keepers if other interactive Remote-SSH windows
+     * are still active; otherwise terminate all keepers cleanly.
+     */
+    public static async stopKeepersIfIdle(): Promise<void> {
+        for (const [host, timer] of TunnelManager.keeperRetryTimers.entries()) {
+            clearTimeout(timer);
+            TunnelManager.keeperRetryTimers.delete(host);
+        }
+        try {
+            const { interactiveHosts, scanSucceeded } = await TunnelManager.discoverActiveSshSessions();
+            if (!scanSucceeded) {
+                const hasTracked =
+                    TunnelManager.activeKeeperChildren.size > 0 ||
+                    Array.from(TunnelManager.activeKeeperPids.values()).some((pid) => TunnelManager.isPidAlive(pid));
+                if (hasTracked) {
+                    logger.log('SSH session discovery failed; preserving existing background tunnel keeper(s).', true);
+                }
+                return;
+            }
+            if (interactiveHosts.length > 0) {
+                logger.log(`Preserving background tunnel keeper(s) for ${interactiveHosts.length} active SSH session(s).`, true);
+                return;
+            }
+        } catch {
+            return;
+        }
+        await TunnelManager.stopAllKeepers();
     }
 
     /**

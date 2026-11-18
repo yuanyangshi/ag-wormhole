@@ -58,5 +58,6 @@ export interface LanguageServerProcessInfo {
     pid: number;
     isPersistent: boolean;
     isUsingProxy: boolean;
+    runtimeType?: 'legacy' | 'agy';
 }
 

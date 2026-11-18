@@ -1,5 +1,7 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
 import * as net from 'net';
+import * as path from 'path';
 import { TunnelManager } from '../core/tunnelManager';
 import { Provisioner } from '../core/provisioner';
 import { IngressRelay } from '../core/ingressRelay';
@@ -433,7 +435,7 @@ suite('Resilience & Stability Unit Tests', function (this: Mocha.Suite) {
         assert.strictEqual(TunnelManager.parseSshCommandDestination(gitCmd2), null);
     });
 
-    test('TunnelManager.sanitizeKeeperSshConfig strips wormhole include and conflicting RemoteForward directives', () => {
+    test('TunnelManager.sanitizeKeeperSshConfig strips wormhole include, multiplexing, and conflicting forwarding directives', () => {
         const rawConfig = [
             'Include config.wormhole',
             'Match host remote-host,remote-host-alt exec "cmd.exe /c ping -n 1 -w 200 192.0.2.10 >nul 2>&1"',
@@ -442,6 +444,11 @@ suite('Resilience & Stability Unit Tests', function (this: Mocha.Suite) {
             'Host remote-host remote-host-alt',
             '    HostName 192.0.2.20',
             '    User remote-host',
+            '    ControlMaster auto',
+            '    ControlPath ~/.ssh/cm-%r@%h:%p',
+            '    ControlPersist 10m',
+            '    LocalForward 8080 127.0.0.1:8080',
+            '    DynamicForward 1080',
             '    ExitOnForwardFailure no',
             '    RemoteForward 7890 127.0.0.1:7890'
         ].join('\n');
@@ -449,10 +456,21 @@ suite('Resilience & Stability Unit Tests', function (this: Mocha.Suite) {
         const sanitized = TunnelManager.sanitizeKeeperSshConfig(rawConfig);
         assert.strictEqual(sanitized.includes('config.wormhole'), false);
         assert.strictEqual(sanitized.includes('RemoteForward'), false);
+        assert.strictEqual(sanitized.includes('LocalForward'), false);
+        assert.strictEqual(sanitized.includes('DynamicForward'), false);
+        assert.strictEqual(sanitized.includes('ControlMaster'), false);
+        assert.strictEqual(sanitized.includes('ControlPath'), false);
+        assert.strictEqual(sanitized.includes('ControlPersist'), false);
         assert.strictEqual(sanitized.includes('ExitOnForwardFailure'), false);
         assert.strictEqual(sanitized.includes('HostName 192.0.2.10'), true);
         assert.strictEqual(sanitized.includes('HostName 192.0.2.20'), true);
         assert.strictEqual(sanitized.includes('User remote-host'), true);
+    });
+
+    test('TunnelManager.stopKeepersIfIdle executes safely without throwing', async () => {
+        await assert.doesNotReject(async () => {
+            await TunnelManager.stopKeepersIfIdle();
+        });
     });
 
     test('Provisioner.findSupersedingSshdPid identifies newer persistent Remote-SSH sessions while ignoring transient bash -c commands', () => {
@@ -589,6 +607,227 @@ suite('Resilience & Stability Unit Tests', function (this: Mocha.Suite) {
         // Safe cross-platform invocation should return a Set without throwing
         const inodes = await Provisioner.getListeningSocketInodes(7890);
         assert.ok(inodes instanceof Set);
+    });
+
+    test('TunnelManager.quoteWindowsCommandArg safely quotes paths with spaces and special characters', () => {
+        assert.strictEqual(TunnelManager.quoteWindowsCommandArg('ssh.exe'), 'ssh.exe');
+        assert.strictEqual(TunnelManager.quoteWindowsCommandArg(''), '""');
+        assert.strictEqual(
+            TunnelManager.quoteWindowsCommandArg('C:\\Users\\example user\\.ssh\\config.wormhole.keeper'),
+            '"C:\\Users\\example user\\.ssh\\config.wormhole.keeper"'
+        );
+        assert.strictEqual(
+            TunnelManager.quoteWindowsCommandArg('val"ue'),
+            '"val\\"ue"'
+        );
+    });
+
+    test('Provisioner.getProtectedPids handles keeper port equal to target port safely', async () => {
+        const protectedSet = await Provisioner.getProtectedPids(7893, 7890);
+        assert.strictEqual(protectedSet.has(1), true);
+        assert.strictEqual(protectedSet.has(process.pid), true);
+    });
+
+    test('TunnelManager.parseSshCommandDestination handles ssh:// URI targets safely', () => {
+        const parsed = TunnelManager.parseSshCommandDestination('ssh.exe -T -D 54321 ssh://example-user@remote-host:2222 bash');
+        assert.deepStrictEqual(parsed, { host: 'example-user@remote-host', isKeeper: false });
+    });
+
+    test('Provisioner.findSafeOrphanPids protects active agy --hub and live mgraftcp-fakedns processes', () => {
+        const activePs = [
+            '100 1 /home/example-user/.antigravity-server/bin/abc/node /home/example-user/.antigravity-server/bin/abc/out/server-main.js',
+            '200 1 /home/example-user/.gemini/bin/agy --hub',
+            '300 1 /home/example-user/.antigravity-server/extensions/ag-wormhole/resources/bin/mgraftcp-fakedns-linux-amd64 --http_proxy 127.0.0.1:7890 language_server_linux_x64.bak',
+            '301 300 /home/example-user/.antigravity-server/extensions/antigravity/bin/language_server_linux_x64.bak',
+            '400 1 /home/example-user/.antigravity-server/extensions/ag-wormhole/resources/bin/mgraftcp-fakedns-linux-amd64 --http_proxy 127.0.0.1:7890 stale.bak',
+            '500 1 notify-send --wait --app-name=Antigravity Done'
+        ].join('\n');
+
+        const safeWhileActive = Provisioner.findSafeOrphanPids(activePs, 999, 301);
+        assert.deepStrictEqual(safeWhileActive, [400, 500]);
+
+        const idlePs = [
+            '200 1 /home/example-user/.gemini/bin/agy --hub',
+            '500 1 notify-send --wait --app-name=Antigravity Done'
+        ].join('\n');
+        const safeWhenIdle = Provisioner.findSafeOrphanPids(idlePs, 999);
+        assert.deepStrictEqual(safeWhenIdle, [200, 500]);
+    });
+
+    test('IngressRelay preserves >750ms HTTP CONNECT and pure SOCKS5 handshakes', async () => {
+        const relay = IngressRelay.getInstance();
+
+        const getFreePort = async (): Promise<number> => {
+            const s = net.createServer();
+            await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+            const p = (s.address() as net.AddressInfo).port;
+            await new Promise<void>((res) => s.close(() => res()));
+            return p;
+        };
+
+        // 1. Slow HTTP CONNECT (> 800ms firstResponseTimeoutMs and > 700ms old timeout)
+        const httpListenPort = await getFreePort();
+        const httpSockets: net.Socket[] = [];
+        const slowHttpProxy = net.createServer((sock) => {
+            httpSockets.push(sock);
+            sock.on('data', (d) => {
+                const req = d.toString('utf8');
+                if (req.startsWith('HEAD /')) {
+                    sock.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+                } else if (req.startsWith('CONNECT ')) {
+                    setTimeout(() => {
+                        if (!sock.destroyed) {
+                            sock.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+                        }
+                    }, 900);
+                }
+            });
+        });
+        await new Promise<void>((res) => slowHttpProxy.listen(0, '127.0.0.1', () => res()));
+        const httpProxyPort = (slowHttpProxy.address() as net.AddressInfo).port;
+
+        try {
+            const started = await relay.startRelay(httpListenPort, httpProxyPort, [httpProxyPort]);
+            assert.strictEqual(started, true);
+
+            const client = new net.Socket();
+            const responseData = await new Promise<string>((resolve, reject) => {
+                client.connect(httpListenPort, '127.0.0.1', () => {
+                    client.write('CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n');
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk.toString('utf8'));
+                });
+                client.on('error', (err) => reject(err));
+            });
+            assert.ok(responseData.includes('200 Connection Established'));
+        } finally {
+            await relay.stopRelay();
+            for (const s of httpSockets) {
+                s.destroy();
+            }
+            await new Promise<void>((res) => slowHttpProxy.close(() => res()));
+        }
+
+        // 2. Pure SOCKS5 upstream (rejects HTTP probes) with 850ms handshake delay
+        const socksListenPort = await getFreePort();
+        const socksSockets: net.Socket[] = [];
+        const slowSocksProxy = net.createServer((sock) => {
+            socksSockets.push(sock);
+            sock.on('data', (d) => {
+                if (d.toString('utf8').startsWith('HEAD /')) {
+                    sock.destroy();
+                    return;
+                }
+                if (d.length === 3 && d[0] === 0x05 && d[1] === 0x01 && d[2] === 0x00) {
+                    sock.write(Buffer.from([0x05, 0x00]));
+                    return;
+                }
+                if (d.length >= 4 && d[0] === 0x05) {
+                    setTimeout(() => {
+                        if (!sock.destroyed) {
+                            sock.write(Buffer.from([0x05, 0x00, 0x4f, 0x4b]));
+                        }
+                    }, 850);
+                }
+            });
+        });
+        await new Promise<void>((res) => slowSocksProxy.listen(0, '127.0.0.1', () => res()));
+        const socksProxyPort = (slowSocksProxy.address() as net.AddressInfo).port;
+
+        try {
+            const started = await relay.startRelay(socksListenPort, socksProxyPort, [socksProxyPort]);
+            assert.strictEqual(started, true);
+
+            const client = new net.Socket();
+            const responseBuf = await new Promise<Buffer>((resolve, reject) => {
+                client.connect(socksListenPort, '127.0.0.1', () => {
+                    client.write(Buffer.from([0x05, 0x02, 0x00, 0x02]));
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk);
+                });
+                client.on('error', (err) => reject(err));
+            });
+            assert.deepStrictEqual(responseBuf, Buffer.from([0x05, 0x00, 0x4f, 0x4b]));
+        } finally {
+            await relay.stopRelay();
+            for (const s of socksSockets) {
+                s.destroy();
+            }
+            await new Promise<void>((res) => slowSocksProxy.close(() => res()));
+        }
+    });
+
+    test('Provisioner.parseLanguageServerFromPs verifies mgraftcp ancestor tracing accurately', () => {
+        const psWithMgraftcp = [
+            '150 100 /home/example-user/.antigravity-server/extensions/ag-wormhole/resources/bin/mgraftcp-fakedns-linux-amd64 --http_proxy 127.0.0.1:7890 language_server_linux_x64.bak',
+            '151 150 /home/example-user/.antigravity-server/extensions/antigravity/bin/language_server_linux_x64.bak --persistent_mode'
+        ].join('\n');
+        const traced = Provisioner.parseLanguageServerFromPs(psWithMgraftcp, 999);
+        assert.strictEqual(traced.hasMgraftcpProcess, true);
+        assert.strictEqual(traced.legacyCandidate?.pid, 151);
+        assert.strictEqual(traced.legacyCandidate?.isTracedByMgraftcp, true);
+
+        const psDirectFallback = [
+            '201 100 /home/example-user/.antigravity-server/extensions/antigravity/bin/language_server_linux_x64.bak --persistent_mode'
+        ].join('\n');
+        const direct = Provisioner.parseLanguageServerFromPs(psDirectFallback, 999);
+        assert.strictEqual(direct.hasMgraftcpProcess, false);
+        assert.strictEqual(direct.legacyCandidate?.pid, 201);
+        assert.strictEqual(direct.legacyCandidate?.isTracedByMgraftcp, false);
+    });
+
+    test('Provisioner.isKeeperSshSessionAlive preserves live keeper on clean EOF and rejects blackhole or closed ports', async () => {
+        // 1. Live sshd returning SSH2_MSG_CHANNEL_OPEN_FAILURE (clean TCP FIN within 50ms)
+        const eofSockets: net.Socket[] = [];
+        const eofServer = net.createServer((sock) => {
+            eofSockets.push(sock);
+            sock.resume();
+            setTimeout(() => {
+                if (!sock.destroyed) {
+                    sock.end();
+                }
+            }, 20);
+        });
+        await new Promise<void>((res) => eofServer.listen(0, '127.0.0.1', () => res()));
+        const eofPort = (eofServer.address() as net.AddressInfo).port;
+
+        // 2. Dead network zombie sshd hanging silently (blackhole)
+        const blackholeSockets: net.Socket[] = [];
+        const blackholeServer = net.createServer((sock) => {
+            blackholeSockets.push(sock);
+        });
+        await new Promise<void>((res) => blackholeServer.listen(0, '127.0.0.1', () => res()));
+        const blackholePort = (blackholeServer.address() as net.AddressInfo).port;
+
+        // 3. Closed port
+        const tmpServer = net.createServer();
+        await new Promise<void>((res) => tmpServer.listen(0, '127.0.0.1', () => res()));
+        const closedPort = (tmpServer.address() as net.AddressInfo).port;
+        await new Promise<void>((res) => tmpServer.close(() => res()));
+
+        try {
+            assert.strictEqual(await Provisioner.isKeeperSshSessionAlive(eofPort, 300), true);
+            assert.strictEqual(await Provisioner.isKeeperSshSessionAlive(blackholePort, 200), false);
+            assert.strictEqual(await Provisioner.isKeeperSshSessionAlive(closedPort, 200), false);
+        } finally {
+            for (const s of [...eofSockets, ...blackholeSockets]) {
+                s.destroy();
+            }
+            await new Promise<void>((res) => eofServer.close(() => res()));
+            await new Promise<void>((res) => blackholeServer.close(() => res()));
+        }
+    });
+
+    test('scripts/setup-proxy.sh retains pure LF line endings and WRAPPER_SCHEMA="2"', () => {
+        const scriptPath = path.resolve(__dirname, '..', '..', 'scripts', 'setup-proxy.sh');
+        const buf = fs.readFileSync(scriptPath);
+        assert.strictEqual(buf.includes(0x0d), false, 'setup-proxy.sh must not contain CR bytes (CRLF)');
+        const text = buf.toString('utf8');
+        assert.strictEqual(text.includes('WRAPPER_SCHEMA="2"'), true);
     });
 });
 

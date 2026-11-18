@@ -11,6 +11,7 @@ import { promisify } from 'util';
 import { logger } from '../shared/logger';
 import { LanguageServerProcessInfo } from '../shared/types';
 import { getSystemArchitecture } from '../shared/environment';
+import { ALL_FALLBACK_PORT_OFFSETS } from '../shared/constants';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -45,7 +46,11 @@ export class Provisioner {
             return Provisioner.cachedMgraftcpRunning.running;
         }
         try {
-            const { stdout } = await execFileAsync('pgrep', ['-f', '[m]graftcp-fakedns'], { timeout: 2000 });
+            const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+            const pgrepArgs = uid !== undefined
+                ? ['-u', String(uid), '-f', '[m]graftcp-fakedns']
+                : ['-f', '[m]graftcp-fakedns'];
+            const { stdout } = await execFileAsync('pgrep', pgrepArgs, { timeout: 2000 });
             const running = stdout.trim().length > 0;
             Provisioner.cachedMgraftcpRunning = { running, timestamp: now };
             return running;
@@ -98,6 +103,115 @@ export class Provisioner {
     }
 
     /**
+     * Pure helper to inspect `ps` output for active Language Server or AGY Hub processes
+     * and verify whether legacy binaries are actually traced by a `mgraftcp-fakedns` ancestor.
+     */
+    public static parseLanguageServerFromPs(
+        stdout: string,
+        currentPid: number
+    ): {
+        legacyCandidate: { pid: number; ppid: number; isPersistent: boolean; isTracedByMgraftcp: boolean } | null;
+        agyCandidate: { pid: number; ppid: number } | null;
+        hasMgraftcpProcess: boolean;
+    } {
+        let hasMgraftcpProcess = false;
+        const ppidMap = new Map<number, number>();
+        const mgraftcpPids = new Set<number>();
+        const rawLegacy: Array<{ pid: number; ppid: number; isPersistent: boolean; cmd: string }> = [];
+        const agyCandidates: Array<{ pid: number; ppid: number }> = [];
+
+        for (const rawLine of stdout.split('\n')) {
+            const line = rawLine.trim();
+            if (!line) {
+                continue;
+            }
+            const match = /^(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+            if (!match) {
+                continue;
+            }
+            const pid = parseInt(match[1], 10);
+            const ppid = parseInt(match[2], 10);
+            const cmd = match[3];
+            if (isNaN(pid) || pid <= 0 || isNaN(ppid)) {
+                continue;
+            }
+
+            ppidMap.set(pid, ppid);
+
+            if (cmd.includes('mgraftcp-fakedns')) {
+                hasMgraftcpProcess = true;
+                mgraftcpPids.add(pid);
+                continue;
+            }
+
+            if (cmd.includes('language_server_linux')) {
+                const isPersistent = cmd.includes('--persistent_mode') || cmd.includes('persistent_mode');
+                rawLegacy.push({ pid, ppid, isPersistent, cmd });
+            } else if (cmd.includes('/.gemini/bin/agy') || cmd.includes('agy --hub')) {
+                agyCandidates.push({ pid, ppid });
+            }
+        }
+
+        const hasMgraftcpAncestor = (startPid: number): boolean => {
+            const visited = new Set<number>([startPid]);
+            let curr = ppidMap.get(startPid);
+            for (let depth = 0; depth < 6 && curr !== undefined && curr > 1; depth++) {
+                if (mgraftcpPids.has(curr)) {
+                    return true;
+                }
+                if (visited.has(curr)) {
+                    break;
+                }
+                visited.add(curr);
+                curr = ppidMap.get(curr);
+            }
+            return false;
+        };
+
+        const legacyCandidates = rawLegacy.map((c) => ({
+            pid: c.pid,
+            ppid: c.ppid,
+            isPersistent: c.isPersistent,
+            isTracedByMgraftcp: c.cmd.includes('mgraftcp') || hasMgraftcpAncestor(c.pid)
+        }));
+
+        legacyCandidates.sort((a, b) => {
+            const aParentRank = a.ppid > 1 ? 0 : 1;
+            const bParentRank = b.ppid > 1 ? 0 : 1;
+            if (aParentRank !== bParentRank) {
+                return aParentRank - bParentRank;
+            }
+            const aProxyRank = a.isTracedByMgraftcp ? 0 : 1;
+            const bProxyRank = b.isTracedByMgraftcp ? 0 : 1;
+            if (aProxyRank !== bProxyRank) {
+                return aProxyRank - bProxyRank;
+            }
+            return b.pid - a.pid;
+        });
+
+        // Prioritize the agy process owned by the current Extension Host (ppid === currentPid),
+        // followed by active parented sessions (ppid > 1), and lastly orphaned ppid === 1 processes.
+        agyCandidates.sort((a, b) => {
+            const rank = (c: { pid: number; ppid: number }): number => {
+                if (c.ppid === currentPid) {
+                    return 0;
+                }
+                if (c.ppid > 1) {
+                    return 1;
+                }
+                return 2;
+            };
+            return rank(a) - rank(b) || b.pid - a.pid;
+        });
+
+        return {
+            legacyCandidate: legacyCandidates[0] ?? null,
+            agyCandidate: agyCandidates[0] ?? null,
+            hasMgraftcpProcess
+        };
+    }
+
+    /**
      * Inspect active Language Server / AGY runtime process state and proxy status.
      * Uses zero-fork /proc/<pid> liveness verification on cached PIDs to avoid spawning
      * shell/ps subprocesses on periodic status refreshes.
@@ -119,80 +233,31 @@ export class Provisioner {
         }
 
         try {
-            const { stdout } = await execFileAsync('ps', ['-eo', 'pid=,ppid=,args='], {
+            const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+            const psArgs = uid !== undefined
+                ? ['-u', String(uid), '-o', 'pid=,ppid=,args=']
+                : ['-eo', 'pid=,ppid=,args='];
+            const { stdout } = await execFileAsync('ps', psArgs, {
                 timeout: 3000,
                 maxBuffer: 512 * 1024
             });
-            const lines = stdout.split('\n');
-            let hasMgraftcpProcess = false;
-            const legacyCandidates: LanguageServerProcessInfo[] = [];
-            const agyCandidates: Array<{ pid: number; ppid: number }> = [];
 
-            for (const rawLine of lines) {
-                const line = rawLine.trim();
-                if (!line) {
-                    continue;
-                }
-                if (line.includes('mgraftcp-fakedns')) {
-                    hasMgraftcpProcess = true;
-                    continue;
-                }
-                if (line.includes('language_server_linux')) {
-                    const match = /^(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-                    if (match) {
-                        const pid = parseInt(match[1], 10);
-                        const cmd = match[3];
-                        const isPersistent = cmd.includes('--persistent_mode') || cmd.includes('persistent_mode');
-                        const isBakBinary = cmd.includes('.bak') || cmd.includes('mgraftcp');
-                        if (!isNaN(pid) && pid > 0) {
-                            legacyCandidates.push({
-                                pid,
-                                isPersistent,
-                                isUsingProxy: isBakBinary
-                            });
-                        }
-                    }
-                } else if (line.includes('/.gemini/bin/agy') || line.includes('agy --hub')) {
-                    const match = /^(\d+)\s+(\d+)\s+/.exec(line);
-                    if (match) {
-                        const pid = parseInt(match[1], 10);
-                        const ppid = parseInt(match[2], 10);
-                        if (!isNaN(pid) && pid > 0 && !isNaN(ppid)) {
-                            agyCandidates.push({ pid, ppid });
-                        }
-                    }
-                }
-            }
+            const parsed = Provisioner.parseLanguageServerFromPs(stdout, process.pid);
+            Provisioner.cachedMgraftcpRunning = { running: parsed.hasMgraftcpProcess, timestamp: now };
 
-            Provisioner.cachedMgraftcpRunning = { running: hasMgraftcpProcess, timestamp: now };
-
-            if (legacyCandidates.length > 0) {
+            if (parsed.legacyCandidate) {
                 const info: LanguageServerProcessInfo = {
-                    pid: legacyCandidates[0].pid,
-                    isPersistent: legacyCandidates[0].isPersistent,
-                    isUsingProxy: legacyCandidates[0].isUsingProxy || hasMgraftcpProcess
+                    pid: parsed.legacyCandidate.pid,
+                    isPersistent: parsed.legacyCandidate.isPersistent,
+                    isUsingProxy: parsed.legacyCandidate.isTracedByMgraftcp,
+                    runtimeType: 'legacy'
                 };
                 Provisioner.cachedLsInfo = { info, timestamp: now };
                 return info;
             }
 
-            // Prioritize the agy process owned by the current Extension Host (ppid === process.pid),
-            // followed by active parented sessions (ppid > 1), and lastly orphaned ppid === 1 processes.
-            agyCandidates.sort((a, b) => {
-                const rank = (c: { pid: number; ppid: number }): number => {
-                    if (c.ppid === process.pid) {
-                        return 0;
-                    }
-                    if (c.ppid > 1) {
-                        return 1;
-                    }
-                    return 2;
-                };
-                return rank(a) - rank(b) || b.pid - a.pid;
-            });
-
-            if (agyCandidates.length > 0) {
-                const chosen = agyCandidates[0];
+            if (parsed.agyCandidate) {
+                const chosen = parsed.agyCandidate;
                 let envReadable = false;
                 let hasProxyEnv = false;
                 try {
@@ -206,7 +271,8 @@ export class Provisioner {
                 const info: LanguageServerProcessInfo = {
                     pid: chosen.pid,
                     isPersistent: false,
-                    isUsingProxy: envReadable ? hasProxyEnv : stateConfigured
+                    isUsingProxy: envReadable ? hasProxyEnv : stateConfigured,
+                    runtimeType: 'agy'
                 };
                 Provisioner.cachedLsInfo = { info, timestamp: now };
                 return info;
@@ -328,17 +394,26 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
 
             const isNewConfig = output.includes('Setup complete') ||
                 (output.includes('Configured:') && !output.includes('Skipped:'));
+            const isAlreadyConfigured = output.includes('Already configured') || output.includes('already synchronized');
 
-            if (isNewConfig) {
-                const proc = await Provisioner.getLanguageServerProcess();
-                if (proc && (!proc.isUsingProxy || proc.isPersistent)) {
-                    await Provisioner.restartLanguageServer();
-                }
-                return true;
-            } else if (output.includes('Already configured') || output.includes('already synchronized')) {
-                const proc = await Provisioner.getLanguageServerProcess();
-                if (proc && !proc.isUsingProxy) {
-                    await Provisioner.restartLanguageServer();
+            if (isNewConfig || isAlreadyConfigured) {
+                const proc = await Provisioner.getLanguageServerProcess(true);
+                if (proc && proc.runtimeType !== 'agy') {
+                    const endpointChanged =
+                        output.includes('proxy_addr:') ||
+                        output.includes('proxy_type:') ||
+                        output.includes('new_install');
+                    const needsWrapperRestart = isNewConfig
+                        ? (!proc.isUsingProxy || (proc.isPersistent && endpointChanged))
+                        : !proc.isUsingProxy;
+
+                    if (needsWrapperRestart) {
+                        if (await Provisioner.hasAnyHealthyTunnelPort(port)) {
+                            await Provisioner.restartLanguageServer();
+                        } else {
+                            logger.log('Skipping Language Server restart: no active proxy tunnel detected (Direct Mode preserved)', false);
+                        }
+                    }
                 }
                 return true;
             }
@@ -626,6 +701,85 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
     }
 
     /**
+     * Check whether the primary proxy port or any cluster fallback port is healthy at L7.
+     */
+    public static async hasAnyHealthyTunnelPort(basePort: number, timeoutMs: number = 500): Promise<boolean> {
+        if (!basePort || basePort <= 0 || basePort > 65535) {
+            return false;
+        }
+        const candidates = [basePort, ...ALL_FALLBACK_PORT_OFFSETS.map(o => basePort + o)];
+        for (const p of candidates) {
+            if (p > 0 && p <= 65535 && await Provisioner.isPortHealthyL7(p, timeoutMs)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Verify whether a keeper port (`basePort + 3`) represents an active SSH tunnel session:
+     * returns `true` if it responds to L7 proxy handshakes OR if TCP connects and cleanly sends EOF (`FIN`),
+     * which occurs when the local `ssh.exe` keeper is alive and immediately returns
+     * `SSH2_MSG_CHANNEL_OPEN_FAILURE` while the local proxy is briefly restarting.
+     * Hung/blackhole sockets (dead peer) and `ECONNREFUSED` return `false`.
+     */
+    public static async isKeeperSshSessionAlive(port: number, timeoutMs: number = 500): Promise<boolean> {
+        if (!port || port <= 0 || port > 65535) {
+            return false;
+        }
+        if (await Provisioner.isPortHealthyL7(port, timeoutMs)) {
+            return true;
+        }
+        return new Promise((resolve) => {
+            const s = new net.Socket();
+            let settled = false;
+            let connected = false;
+            let sawErrorOrTimeout = false;
+
+            const finish = (ok: boolean) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                s.removeAllListeners();
+                s.destroy();
+                resolve(ok);
+            };
+
+            s.setTimeout(timeoutMs);
+            s.on('connect', () => {
+                connected = true;
+                try {
+                    s.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+                } catch {
+                    sawErrorOrTimeout = true;
+                    finish(false);
+                }
+            });
+            s.on('data', (chunk) => {
+                const text = chunk ? chunk.toString('utf8') : '';
+                const isProxy = /^HTTP\/1\.[01]\s+\d+/i.test(text) || Boolean(chunk && chunk.length >= 2 && chunk[0] === 0x05);
+                if (isProxy) {
+                    finish(true);
+                }
+            });
+            s.on('end', () => {
+                finish(connected && !sawErrorOrTimeout);
+            });
+            s.on('timeout', () => {
+                sawErrorOrTimeout = true;
+                finish(false);
+            });
+            s.on('error', () => {
+                sawErrorOrTimeout = true;
+                finish(false);
+            });
+            s.on('close', () => finish(false));
+            s.connect(port, '127.0.0.1');
+        });
+    }
+
+    /**
      * Collect all ancestor PIDs of the current Extension Host up to PID 1
      * to prevent terminating the active SSH daemon or remote IDE server tree.
      */
@@ -653,12 +807,12 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
             }
         }
 
-        // 2. Protect active dedicated background keeper listener on (basePort ?? port) + 3 ONLY if verified alive at L7.
+        // 2. Protect active dedicated background keeper listener on (basePort ?? port) + 3 when its SSH session is alive.
         // Using basePort ensures reclaiming fallback ports (e.g. 7891, 7892) still protects the keeper on 7893.
         const effectiveBasePort = basePort ?? port;
         const keeperPort = effectiveBasePort + 3;
-        if (keeperPort > 0 && keeperPort <= 65535 && keeperPort !== port) {
-            const isKeeperPortAlive = await Provisioner.isPortHealthyL7(keeperPort, 500);
+        if (keeperPort > 0 && keeperPort <= 65535) {
+            const isKeeperPortAlive = await Provisioner.isKeeperSshSessionAlive(keeperPort, 500);
 
             if (isKeeperPortAlive) {
                 const keeperPids = await Provisioner.getListeningPids(keeperPort);
@@ -666,27 +820,40 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
                     protectedPids.add(pid);
                 }
                 // Under unprivileged Linux accounts, `ss -lptn` hides `sshd` PIDs.
-                // Protect the newest childless `sshd` (the active `ssh -N` background keeper).
+                // First try exact /proc/net/tcp{,6} socket inode matching for keeperPort;
+                // only fall back to protecting the newest childless `sshd` if inode lookup is unavailable.
                 if (keeperPids.length === 0) {
+                    const keeperInodes = await Provisioner.getListeningSocketInodes(keeperPort);
                     const userSshdPids = await Provisioner.getUnprivilegedUserSshdPids();
-                    let newestKeeperPid: number | null = null;
-                    let newestKeeperStart = -1;
-                    for (const sshdPid of userSshdPids) {
-                        try {
-                            const { stdout: childrenOut } = await execAsync(`pgrep -P ${sshdPid} 2>/dev/null || true`);
-                            if (childrenOut.trim().length === 0) {
-                                const startTicks = await Provisioner.getProcessStartTimeTicks(sshdPid);
-                                if (startTicks !== null && startTicks > newestKeeperStart) {
-                                    newestKeeperStart = startTicks;
-                                    newestKeeperPid = sshdPid;
-                                }
+                    let matchedByInode = false;
+                    if (keeperInodes.size > 0) {
+                        for (const sshdPid of userSshdPids) {
+                            if (await Provisioner.processHoldsSocketInode(sshdPid, keeperInodes)) {
+                                protectedPids.add(sshdPid);
+                                matchedByInode = true;
                             }
-                        } catch {
-                            // Ignore individual process inspection error
                         }
                     }
-                    if (newestKeeperPid !== null) {
-                        protectedPids.add(newestKeeperPid);
+                    if (!matchedByInode) {
+                        let newestKeeperPid: number | null = null;
+                        let newestKeeperStart = -1;
+                        for (const sshdPid of userSshdPids) {
+                            try {
+                                const { stdout: childrenOut } = await execAsync(`pgrep -P ${sshdPid} 2>/dev/null || true`);
+                                if (childrenOut.trim().length === 0) {
+                                    const startTicks = await Provisioner.getProcessStartTimeTicks(sshdPid);
+                                    if (startTicks !== null && startTicks > newestKeeperStart) {
+                                        newestKeeperStart = startTicks;
+                                        newestKeeperPid = sshdPid;
+                                    }
+                                }
+                            } catch {
+                                // Ignore individual process inspection error
+                            }
+                        }
+                        if (newestKeeperPid !== null) {
+                            protectedPids.add(newestKeeperPid);
+                        }
                     }
                 }
             }
@@ -795,8 +962,6 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
                             pids.push(candidatePid);
                         }
                     }
-                } else {
-                    pids = candidateSshdPids;
                 }
             }
             if (pids.length === 0) {
@@ -913,8 +1078,73 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
     }
 
     /**
-     * Reap orphaned PPid=1 runtime processes (e.g. orphaned `agy --hub`, `mgraftcp-fakedns`, or hung `notify-send`)
-     * whose parent Extension Host or wrapper has already exited, preventing memory leaks and zombie accumulation.
+     * Determine which PPid=1 runtime processes are genuinely orphaned and safe to reap.
+     * Protects active `agy --hub` processes when any IDE server/extension host is alive,
+     * and protects `mgraftcp-fakedns` processes that still host active child processes.
+     */
+    public static findSafeOrphanPids(psStdout: string, currentPid: number, activeLsPid?: number): number[] {
+        interface ProcEntry {
+            pid: number;
+            ppid: number;
+            cmd: string;
+        }
+        const entries: ProcEntry[] = [];
+        const childCounts = new Map<number, number>();
+        let hasActiveIdeServer = false;
+
+        for (const rawLine of psStdout.split('\n')) {
+            const line = rawLine.trim();
+            if (!line) {
+                continue;
+            }
+            const match = /^(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+            if (!match) {
+                continue;
+            }
+            const pid = parseInt(match[1], 10);
+            const ppid = parseInt(match[2], 10);
+            const cmd = match[3];
+            if (isNaN(pid) || pid <= 1 || isNaN(ppid)) {
+                continue;
+            }
+            entries.push({ pid, ppid, cmd });
+            childCounts.set(ppid, (childCounts.get(ppid) || 0) + 1);
+
+            if (
+                cmd.includes('antigravity-server') ||
+                cmd.includes('antigravity-ide-server') ||
+                cmd.includes('vscode-server') ||
+                cmd.includes('language_server_linux')
+            ) {
+                hasActiveIdeServer = true;
+            }
+        }
+
+        const safeToReap: number[] = [];
+        for (const entry of entries) {
+            if (entry.ppid !== 1 || entry.pid === currentPid || (activeLsPid !== undefined && entry.pid === activeLsPid)) {
+                continue;
+            }
+            if (entry.cmd.includes('notify-send --wait --app-name=Antigravity')) {
+                safeToReap.push(entry.pid);
+            } else if (entry.cmd.includes('mgraftcp-fakedns')) {
+                // Only reap mgraftcp-fakedns when its wrapped child has already exited
+                if ((childCounts.get(entry.pid) || 0) === 0) {
+                    safeToReap.push(entry.pid);
+                }
+            } else if (/\/\.gemini\/bin\/agy\b/.test(entry.cmd) && entry.cmd.includes('--hub')) {
+                // Never kill an agy --hub daemon while an IDE server session is active
+                if (!hasActiveIdeServer && (childCounts.get(entry.pid) || 0) === 0) {
+                    safeToReap.push(entry.pid);
+                }
+            }
+        }
+        return safeToReap;
+    }
+
+    /**
+     * Reap genuinely orphaned PPid=1 runtime processes (e.g. hung `notify-send` or exited `mgraftcp-fakedns` shells)
+     * without terminating active `agy --hub` or live wrapped Language Server instances.
      */
     public static async reapOrphanProcesses(): Promise<number[]> {
         if (process.platform !== 'linux') {
@@ -922,37 +1152,20 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
         }
         const reaped: number[] = [];
         try {
+            const activeLs = await Provisioner.getLanguageServerProcess();
             const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
             const args = uid !== undefined
                 ? ['-u', String(uid), '-o', 'pid=,ppid=,args=']
                 : ['-eo', 'pid=,ppid=,args='];
             const { stdout } = await execFileAsync('ps', args, { timeout: 3000, maxBuffer: 512 * 1024 });
-            for (const rawLine of stdout.split('\n')) {
-                const line = rawLine.trim();
-                if (!line) {
-                    continue;
-                }
-                const match = /^(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-                if (!match) {
-                    continue;
-                }
-                const pid = parseInt(match[1], 10);
-                const ppid = parseInt(match[2], 10);
-                const cmd = match[3];
-                if (isNaN(pid) || pid <= 1 || ppid !== 1 || pid === process.pid) {
-                    continue;
-                }
-                if (
-                    (/\/\.gemini\/bin\/agy\b/.test(cmd) && cmd.includes('--hub')) ||
-                    cmd.includes('mgraftcp-fakedns') ||
-                    cmd.includes('notify-send --wait --app-name=Antigravity')
-                ) {
-                    try {
-                        process.kill(pid, 'SIGKILL');
-                        reaped.push(pid);
-                    } catch {
-                        // Ignore EPERM/ESRCH
-                    }
+            const candidates = Provisioner.findSafeOrphanPids(stdout, process.pid, activeLs?.pid);
+
+            for (const pid of candidates) {
+                try {
+                    process.kill(pid, 'SIGKILL');
+                    reaped.push(pid);
+                } catch {
+                    // Ignore EPERM/ESRCH
                 }
             }
             if (reaped.length > 0) {

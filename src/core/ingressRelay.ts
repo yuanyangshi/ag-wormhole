@@ -21,7 +21,7 @@ export class IngressRelay {
     private readonly maxRounds = 25;
     private readonly baseRetryDelayMs = 150;
     private readonly maxPreBufferBytes = 65536;
-    private readonly firstResponseTimeoutMs = 260;
+    private readonly firstResponseTimeoutMs = 800;
 
     private constructor() {}
 
@@ -57,52 +57,64 @@ export class IngressRelay {
     /**
      * Perform a fast application-level (L7) proxy verification against a candidate port
      * to reject dead zombie sshd sockets that accept TCP SYN-ACKs but hang or immediately EOF.
+     * Supports both HTTP proxy and SOCKS5 upstreams.
      */
-    private verifyUpstreamCandidateL7(port: number, timeoutMs: number = 350): Promise<boolean> {
-        return new Promise((resolve) => {
-            const probeSocket = new net.Socket();
-            let settled = false;
+    private async verifyUpstreamCandidateL7(port: number, timeoutMs: number = 600): Promise<boolean> {
+        const probeSingle = (mode: 'http' | 'socks5', budgetMs: number): Promise<boolean> =>
+            new Promise((resolve) => {
+                const probeSocket = new net.Socket();
+                let settled = false;
 
-            const finish = (ok: boolean) => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                probeSocket.removeAllListeners();
-                probeSocket.destroy();
-                resolve(ok);
-            };
+                const finish = (ok: boolean) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    probeSocket.removeAllListeners();
+                    probeSocket.destroy();
+                    resolve(ok);
+                };
 
-            probeSocket.setNoDelay(true);
-            probeSocket.setTimeout(timeoutMs);
+                probeSocket.setNoDelay(true);
+                probeSocket.setTimeout(budgetMs);
 
-            probeSocket.on('connect', () => {
-                try {
-                    probeSocket.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
-                } catch {
-                    finish(false);
-                }
+                probeSocket.on('connect', () => {
+                    try {
+                        if (mode === 'socks5') {
+                            probeSocket.write(Buffer.from([0x05, 0x01, 0x00]));
+                        } else {
+                            probeSocket.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+                        }
+                    } catch {
+                        finish(false);
+                    }
+                });
+
+                probeSocket.on('data', (chunk) => {
+                    if (!chunk || chunk.length === 0) {
+                        finish(false);
+                        return;
+                    }
+                    if (mode === 'socks5') {
+                        finish(chunk.length >= 2 && chunk[0] === 0x05);
+                    } else {
+                        const text = chunk.toString('utf8');
+                        finish(/^HTTP\/1\.[01]\s+\d+/i.test(text));
+                    }
+                });
+
+                probeSocket.on('timeout', () => finish(false));
+                probeSocket.on('error', () => finish(false));
+                probeSocket.on('close', () => finish(false));
+
+                probeSocket.connect(port, '127.0.0.1');
             });
 
-            probeSocket.on('data', (chunk) => {
-                if (chunk && chunk.length > 0) {
-                    const text = chunk.toString('utf8');
-                    const isHttpOrSocks = /^HTTP\/1\.[01]\s+\d+/i.test(text) || (chunk.length >= 2 && chunk[0] === 0x05);
-                    finish(isHttpOrSocks);
-                } else {
-                    finish(false);
-                }
-            });
-
-            probeSocket.on('timeout', () => {
-                finish(false);
-            });
-
-            probeSocket.on('error', () => finish(false));
-            probeSocket.on('close', () => finish(false));
-
-            probeSocket.connect(port, '127.0.0.1');
-        });
+        const budget = Math.max(250, Math.floor(timeoutMs * 0.6));
+        if (await probeSingle('http', budget)) {
+            return true;
+        }
+        return probeSingle('socks5', budget);
     }
 
     /**
@@ -320,8 +332,10 @@ export class IngressRelay {
                             graceTimer = null;
                         }
                         clearResponseTimer();
-                        targetSocket.setTimeout(300000);
-                        clientSocket.setTimeout(300000);
+                        // Disable idle socket timeout once piped so long-lived AI/SSE/LSP streams
+                        // are never dropped during quiet periods; rely on TCP keepalive instead.
+                        targetSocket.setTimeout(0);
+                        clientSocket.setTimeout(0);
                         if (!isConnectedToCandidate && clientPreBuffer.length > 0) {
                             try {
                                 targetSocket.write(Buffer.concat(clientPreBuffer));
@@ -366,6 +380,9 @@ export class IngressRelay {
                     };
 
                     targetSocket.connect(candidatePort, '127.0.0.1', () => {
+                        // Extend socket timeout past firstResponseTimeoutMs + out-of-band L7 probe
+                        // so slow outbound HTTP CONNECT / SOCKS5 dials are never killed prematurely at 700ms.
+                        targetSocket.setTimeout(this.firstResponseTimeoutMs + 1500);
                         // Guard against zombie sshd ports that complete TCP 3-way handshake
                         // and then either immediately send FIN/RST or swallow the request as a half-open blackhole.
                         graceTimer = setTimeout(() => {
@@ -394,7 +411,7 @@ export class IngressRelay {
                                     commitVerifiedPipe();
                                     return;
                                 }
-                                this.verifyUpstreamCandidateL7(candidatePort, 220).then((l7Alive) => {
+                                this.verifyUpstreamCandidateL7(candidatePort, 600).then((l7Alive) => {
                                     if (isPiped || clientSocket.destroyed || targetSocket.destroyed) {
                                         return;
                                     }
@@ -436,11 +453,23 @@ export class IngressRelay {
                             clientSocket.end();
                         }
                     });
-                    targetSocket.on('close', () => {
+                    targetSocket.on('close', (hadError: boolean) => {
                         if (!isPiped) {
                             onCandidateFail();
                         } else if (!clientSocket.destroyed) {
-                            clientSocket.destroy();
+                            if (hadError) {
+                                clientSocket.destroy();
+                            } else {
+                                clientSocket.end();
+                                const flushTimer = setTimeout(() => {
+                                    if (!clientSocket.destroyed) {
+                                        clientSocket.destroy();
+                                    }
+                                }, 2000);
+                                if (typeof flushTimer.unref === 'function') {
+                                    flushTimer.unref();
+                                }
+                            }
                         }
                     });
                 };

@@ -25,6 +25,8 @@ PROXY_TYPE="${PROXY_TYPE:-http}"
 [ "$PROXY_TYPE" = "__PROXY_TYPE__" ] && PROXY_TYPE="http"
 EXTENSION_PATH="${EXTENSION_PATH:-}"
 EXTENSION_VERSION="${EXTENSION_VERSION:-1.0.0}"
+WRAPPER_SCHEMA="2"
+TARGET_WRAPPER_VERSION="${EXTENSION_VERSION}-r${WRAPPER_SCHEMA}"
 PROXY_ADDR="${PROXY_HOST}:${PROXY_PORT}"
 
 DEBUG="${DEBUG:-0}"
@@ -185,8 +187,8 @@ check_needs_update() {
     fi
     
     local wrapper_version=$(get_wrapper_version "$target")
-    if [ "$EXTENSION_VERSION" != "$wrapper_version" ]; then
-        echo "version:$wrapper_version->$EXTENSION_VERSION"
+    if [ "$TARGET_WRAPPER_VERSION" != "$wrapper_version" ]; then
+        echo "version:$wrapper_version->$TARGET_WRAPPER_VERSION"
         return 0
     fi
     
@@ -380,50 +382,124 @@ export no_proxy="${no_proxy:-localhost,127.0.0.1,::1}"
 export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,::1}"
 
 # Pre-flight Ingress L7 Readiness Wait & Dynamic Cluster Failover:
-# Verify both TCP connectivity and L7 proxy responsiveness to bypass dead zombie sshd
-# listeners, waiting up to 4.0s on cold start and failing over to PORT+1..PORT+3 if needed.
+# Bound total startup probing to <=3.5s so the IDE never kills the Language Server for timing out.
+# Give primary WORMHOLE_PORT a 1.2s priority window before failing over to PORT+1..PORT+5.
 WORMHOLE_HOST="${PROXY_ADDR%:*}"
 WORMHOLE_PORT="${PROXY_ADDR##*:}"
-_probe_proxy_l7() {
-    local _h="$1"
-    local _p="$2"
-    if [ "$PROXY_TYPE" = "socks5" ]; then
-        if timeout 0.8 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf '\x05\x01\x00' >&3 && IFS= read -r -t 0.6 -n 1 _c <&3" "$_h" "$_p" 2>/dev/null; then
-            return 0
+_PORT_READY=0
+if command -v python3 >/dev/null 2>&1; then
+    _RESOLVED_ADDR=$(python3 - "$WORMHOLE_HOST" "$WORMHOLE_PORT" "$PROXY_TYPE" 2>/dev/null << 'PY_EOF'
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+base_port = int(sys.argv[2])
+proxy_type = sys.argv[3].lower()
+start = time.monotonic()
+deadline = start + 3.5
+
+def check_proto(port, mode, budget):
+    if budget <= 0.05:
+        return False
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(budget)
+    try:
+        sock.connect((host, port))
+        if mode == 'socks5':
+            sock.sendall(b'\x05\x01\x00')
+            data = sock.recv(2)
+            return len(data) >= 2 and data[0] == 5
+        sock.sendall(b'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n')
+        data = sock.recv(16)
+        return data.startswith(b'HTTP/')
+    except Exception:
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+def probe_port(port):
+    rem = deadline - time.monotonic()
+    if rem <= 0.05:
+        return False
+    primary = 'socks5' if proxy_type == 'socks5' else 'http'
+    alt = 'http' if primary == 'socks5' else 'socks5'
+    if check_proto(port, primary, min(0.35, rem)):
+        return True
+    rem = deadline - time.monotonic()
+    if rem > 0.15 and check_proto(port, alt, min(0.35, rem)):
+        return True
+    return False
+
+while time.monotonic() < deadline:
+    elapsed = time.monotonic() - start
+    ports = [base_port] if elapsed < 1.2 else [base_port + o for o in (0, 1, 2, 3, 4, 5)]
+    for p in ports:
+        if time.monotonic() >= deadline:
+            break
+        if probe_port(p):
+            print(f"{host}:{p}")
+            sys.exit(0)
+    if time.monotonic() >= deadline:
+        break
+    time.sleep(0.15)
+sys.exit(1)
+PY_EOF
+)
+    if [ -n "$_RESOLVED_ADDR" ]; then
+        if [ "$_RESOLVED_ADDR" != "$PROXY_ADDR" ]; then
+            PROXY_ADDR="$_RESOLVED_ADDR"
+            export http_proxy="http://${PROXY_ADDR}"
+            export https_proxy="http://${PROXY_ADDR}"
+            export HTTP_PROXY="http://${PROXY_ADDR}"
+            export HTTPS_PROXY="http://${PROXY_ADDR}"
+            export all_proxy="${PROXY_TYPE}://${PROXY_ADDR}"
+            export ALL_PROXY="${PROXY_TYPE}://${PROXY_ADDR}"
         fi
-    else
-        if timeout 0.8 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 && IFS= read -r -t 0.6 _line <&3 && [ -n \"\$_line\" ]" "$_h" "$_p" 2>/dev/null; then
-            return 0
+        _PORT_READY=1
+    fi
+elif command -v timeout >/dev/null 2>&1; then
+    _probe_proxy_l7() {
+        local _h="$1"
+        local _p="$2"
+        if [ "$PROXY_TYPE" = "socks5" ]; then
+            timeout 0.4 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf '\x05\x01\x00' >&3 && IFS= read -r -t 0.3 -n 1 _c <&3" "$_h" "$_p" 2>/dev/null && return 0
+        else
+            timeout 0.4 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 && IFS= read -r -t 0.3 _line <&3 && [ -n \"\$_line\" ]" "$_h" "$_p" 2>/dev/null && return 0
         fi
-    fi
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "import socket; s = socket.socket(); s.settimeout(0.6); s.connect(('$_h', int('$_p'))); s.sendall(b'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'); exit(0 if s.recv(16) else 1)" 2>/dev/null && return 0
-    fi
-    return 1
-}
-if command -v timeout >/dev/null 2>&1; then
-    _PORT_READY=0
-    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+        return 1
+    }
+    _DEADLINE=$((SECONDS + 4))
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        [ "$SECONDS" -ge "$_DEADLINE" ] && break
         if _probe_proxy_l7 "${WORMHOLE_HOST}" "${WORMHOLE_PORT}"; then
             _PORT_READY=1
             break
         fi
-        for _OFFSET in 1 2 3 4 5; do
-            _CAND_PORT=$((WORMHOLE_PORT + _OFFSET))
-            if _probe_proxy_l7 "${WORMHOLE_HOST}" "${_CAND_PORT}"; then
-                PROXY_ADDR="${WORMHOLE_HOST}:${_CAND_PORT}"
-                export http_proxy="http://${PROXY_ADDR}"
-                export https_proxy="http://${PROXY_ADDR}"
-                export HTTP_PROXY="http://${PROXY_ADDR}"
-                export HTTPS_PROXY="http://${PROXY_ADDR}"
-                export all_proxy="${PROXY_TYPE}://${PROXY_ADDR}"
-                export ALL_PROXY="${PROXY_TYPE}://${PROXY_ADDR}"
-                _PORT_READY=1
-                break 2
-            fi
-        done
+        if [ "$_i" -ge 5 ]; then
+            for _OFFSET in 1 2 3 4 5; do
+                [ "$SECONDS" -ge "$_DEADLINE" ] && break 2
+                _CAND_PORT=$((WORMHOLE_PORT + _OFFSET))
+                if _probe_proxy_l7 "${WORMHOLE_HOST}" "${_CAND_PORT}"; then
+                    PROXY_ADDR="${WORMHOLE_HOST}:${_CAND_PORT}"
+                    export http_proxy="http://${PROXY_ADDR}"
+                    export https_proxy="http://${PROXY_ADDR}"
+                    export HTTP_PROXY="http://${PROXY_ADDR}"
+                    export HTTPS_PROXY="http://${PROXY_ADDR}"
+                    export all_proxy="${PROXY_TYPE}://${PROXY_ADDR}"
+                    export ALL_PROXY="${PROXY_TYPE}://${PROXY_ADDR}"
+                    _PORT_READY=1
+                    break 2
+                fi
+            done
+        fi
         sleep 0.25
     done
+else
+    _PORT_READY=1
 fi
 
 if [ "$_PORT_READY" = "0" ]; then
@@ -441,7 +517,7 @@ WRAPPER_EOF
 
     sed -i "s|__PROXY_ADDR_PLACEHOLDER__|$PROXY_ADDR|g" "$WRAPPER_TMP"
     sed -i "s|__PROXY_TYPE_PLACEHOLDER__|$PROXY_TYPE|g" "$WRAPPER_TMP"
-    sed -i "s|__EXTENSION_VERSION_PLACEHOLDER__|$EXTENSION_VERSION|g" "$WRAPPER_TMP"
+    sed -i "s|__EXTENSION_VERSION_PLACEHOLDER__|$TARGET_WRAPPER_VERSION|g" "$WRAPPER_TMP"
     sed -i "s|__TIMESTAMP_PLACEHOLDER__|$(date -Iseconds)|g" "$WRAPPER_TMP"
     
     if [ -n "$EXTENSION_PATH" ]; then
