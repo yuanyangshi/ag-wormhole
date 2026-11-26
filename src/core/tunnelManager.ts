@@ -20,6 +20,8 @@ import {
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
+export type L7ProbeReason = 'ok' | 'econnrefused' | 'eof' | 'timeout' | 'protocol' | 'error';
+
 export class TunnelManager {
     private static isSyncingKeepers = false;
     private static lastKeeperSyncMs = 0;
@@ -29,6 +31,21 @@ export class TunnelManager {
     private static keeperRetryCounts = new Map<string, number>();
     private static keeperRetryTimers = new Map<string, NodeJS.Timeout>();
     private static isShuttingDownKeepers = false;
+    private static activeKeeperForwardSpec = '';
+
+    /**
+     * Determine whether the keeper forwarding specification (`localPort->remotePort`)
+     * changed compared to the previously active spec.
+     */
+    public static hasKeeperForwardSpecChanged(
+        previousSpec: string,
+        localPort: number,
+        remotePort: number
+    ): { changed: boolean; nextSpec: string } {
+        const nextSpec = `${localPort}->${remotePort}`;
+        const changed = Boolean(previousSpec && previousSpec !== nextSpec);
+        return { changed, nextSpec };
+    }
     /**
      * Test TCP connectivity to specified endpoint
      */
@@ -63,9 +80,9 @@ export class TunnelManager {
         port: number,
         proxyType: string = 'http',
         timeoutMs: number = 3000
-    ): Promise<{ ok: boolean; message: string }> {
+    ): Promise<{ ok: boolean; message: string; reason: L7ProbeReason }> {
         const primaryResult = await TunnelManager.checkProxyL7Single(host, port, proxyType, timeoutMs);
-        if (primaryResult.ok) {
+        if (primaryResult.ok || primaryResult.reason === 'econnrefused') {
             return primaryResult;
         }
 
@@ -75,7 +92,8 @@ export class TunnelManager {
         if (fallbackResult.ok) {
             return {
                 ok: true,
-                message: `${fallbackResult.message} (auto-adapted to ${alternateType.toUpperCase()})`
+                message: `${fallbackResult.message} (auto-adapted to ${alternateType.toUpperCase()})`,
+                reason: 'ok'
             };
         }
 
@@ -87,12 +105,16 @@ export class TunnelManager {
         port: number,
         proxyType: string,
         timeoutMs: number
-    ): Promise<{ ok: boolean; message: string }> {
+    ): Promise<{ ok: boolean; message: string; reason: L7ProbeReason }> {
         return new Promise((resolve) => {
             const socket = new net.Socket();
             let resolved = false;
+            let connected = false;
+            let sawTimeout = false;
+            let sawError = false;
+            let sawCleanEnd = false;
 
-            const finalize = (ok: boolean, message: string) => {
+            const finalize = (ok: boolean, message: string, reason: L7ProbeReason) => {
                 if (resolved) {
                     return;
                 }
@@ -100,12 +122,13 @@ export class TunnelManager {
                 socket.removeAllListeners();
                 socket.end();
                 socket.destroy();
-                resolve({ ok, message });
+                resolve({ ok, message, reason });
             };
 
             socket.setTimeout(timeoutMs);
 
             socket.on('connect', () => {
+                connected = true;
                 try {
                     if (proxyType.toLowerCase() === 'socks5') {
                         // SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0 (No Auth)
@@ -115,39 +138,55 @@ export class TunnelManager {
                         socket.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
                     }
                 } catch (err: unknown) {
+                    sawError = true;
                     const e = err as { message?: string };
-                    finalize(false, `Failed to write L7 probe frame: ${e.message}`);
+                    finalize(false, `Failed to write L7 probe frame: ${e.message}`, 'error');
                 }
             });
 
             socket.on('data', (data) => {
                 if (proxyType.toLowerCase() === 'socks5') {
                     if (data.length >= 2 && data[0] === 0x05) {
-                        finalize(true, 'SOCKS5 proxy responded with valid greeting handshake');
+                        finalize(true, 'SOCKS5 proxy responded with valid greeting handshake', 'ok');
                     } else {
-                        finalize(false, `Unexpected response byte from SOCKS5 listener (0x${data[0]?.toString(16)})`);
+                        finalize(false, `Unexpected response byte from SOCKS5 listener (0x${data[0]?.toString(16)})`, 'protocol');
                     }
                 } else {
                     const resp = data.toString('utf-8');
-                    if (resp.startsWith('HTTP/')) {
-                        finalize(true, 'HTTP proxy returned valid status line');
+                    if (/^HTTP\/\d/i.test(resp)) {
+                        finalize(true, 'HTTP proxy returned valid status line', 'ok');
                     } else {
-                        finalize(false, 'Non-HTTP response received from proxy gateway');
+                        finalize(false, 'Non-HTTP response received from proxy gateway', 'protocol');
                     }
                 }
             });
 
-            socket.on('timeout', () => {
-                finalize(false, `L7 proxy handshake timed out after ${timeoutMs}ms`);
+            socket.on('end', () => {
+                sawCleanEnd = true;
             });
 
-            socket.on('error', (err) => {
-                finalize(false, `L7 socket connection error: ${err.message}`);
+            socket.on('timeout', () => {
+                sawTimeout = true;
+                finalize(false, `L7 proxy handshake timed out after ${timeoutMs}ms`, 'timeout');
+            });
+
+            socket.on('error', (err: NodeJS.ErrnoException) => {
+                sawError = true;
+                const reason: L7ProbeReason = err.code === 'ECONNREFUSED' ? 'econnrefused' : 'error';
+                finalize(false, `L7 socket connection error: ${err.message}`, reason);
             });
 
             socket.on('close', () => {
                 if (!resolved) {
-                    finalize(false, 'Socket closed before L7 handshake response was received');
+                    const isCleanEof = connected && !sawTimeout && !sawError;
+                    const reason: L7ProbeReason = isCleanEof ? 'eof' : 'error';
+                    finalize(
+                        false,
+                        sawCleanEnd || isCleanEof
+                            ? 'Socket closed cleanly before L7 handshake response (SSH tunnel alive, local proxy unreachable)'
+                            : 'Socket closed before L7 handshake response was received',
+                        reason
+                    );
                 }
             });
 
@@ -525,8 +564,13 @@ export class TunnelManager {
                 (pid) => TunnelManager.isPidAlive(pid)
             );
         const hasLiveTrackedKeepers = hasLiveTrackedChildren || hasLiveTrackedPids;
+        const { changed: specChanged, nextSpec } = TunnelManager.hasKeeperForwardSpecChanged(
+            TunnelManager.activeKeeperForwardSpec,
+            localPort,
+            remotePort
+        );
         const minIntervalMs = hadDeadTrackedPid ? 5000 : (hasLiveTrackedKeepers ? 60000 : 20000);
-        if (!force && enabled && now - TunnelManager.lastKeeperSyncMs < minIntervalMs) {
+        if (!force && !specChanged && enabled && now - TunnelManager.lastKeeperSyncMs < minIntervalMs) {
             return;
         }
         TunnelManager.isSyncingKeepers = true;
@@ -548,6 +592,21 @@ export class TunnelManager {
             if (!scanSucceeded) {
                 logger.log('Skipping keeper reconciliation: SSH process scan timed out or failed.', true);
                 return;
+            }
+
+            if (specChanged) {
+                logger.log(
+                    `Keeper forwarding spec changed (${TunnelManager.activeKeeperForwardSpec} -> ${nextSpec}); recycling existing keepers.`,
+                    true
+                );
+                await TunnelManager.stopAllKeepers();
+                for (const pids of keeperPidsByHost.values()) {
+                    for (const pid of pids) {
+                        await TunnelManager.terminateKeeperProcess(pid);
+                    }
+                }
+                keeperPidsByHost.clear();
+                TunnelManager.isShuttingDownKeepers = false;
             }
 
             // Terminate keeper processes for hosts that no longer have any active interactive Remote-SSH session
@@ -588,6 +647,8 @@ export class TunnelManager {
             if (!localReachable) {
                 return;
             }
+
+            TunnelManager.activeKeeperForwardSpec = nextSpec;
 
             for (const host of interactiveHosts) {
                 const existingKeepers = keeperPidsByHost.get(host) || [];
@@ -733,6 +794,7 @@ export class TunnelManager {
      */
     public static async stopAllKeepers(): Promise<void> {
         TunnelManager.isShuttingDownKeepers = true;
+        TunnelManager.activeKeeperForwardSpec = '';
         for (const [host, timer] of TunnelManager.keeperRetryTimers.entries()) {
             clearTimeout(timer);
             TunnelManager.keeperRetryTimers.delete(host);
@@ -800,6 +862,17 @@ export class TunnelManager {
                 // Ignore missing file
             }
 
+            try {
+                const entries: string[] = await fs.readdir(sshDir);
+                for (const entry of entries) {
+                    if (/^config\.wormhole(\.keeper)?\..*tmp$/.test(entry)) {
+                        await fs.unlink(path.join(sshDir, entry)).catch(() => {});
+                    }
+                }
+            } catch {
+                // Ignore missing sshDir
+            }
+
             await TunnelManager.stopAllKeepers();
 
             // Recycle existing keeper processes
@@ -809,6 +882,8 @@ export class TunnelManager {
                     await TunnelManager.terminateKeeperProcess(pid);
                 }
             }
+            TunnelManager.isShuttingDownKeepers = false;
+            TunnelManager.lastKeeperSyncMs = 0;
             logger.log('Purged local temporary SSH artifacts and recycled background keepers.', true);
         } catch (err) {
             logger.log(`Notice during local cache purge: ${err}`, true);

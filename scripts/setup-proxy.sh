@@ -25,7 +25,7 @@ PROXY_TYPE="${PROXY_TYPE:-http}"
 [ "$PROXY_TYPE" = "__PROXY_TYPE__" ] && PROXY_TYPE="http"
 EXTENSION_PATH="${EXTENSION_PATH:-}"
 EXTENSION_VERSION="${EXTENSION_VERSION:-1.0.0}"
-WRAPPER_SCHEMA="2"
+WRAPPER_SCHEMA="4"
 TARGET_WRAPPER_VERSION="${EXTENSION_VERSION}-r${WRAPPER_SCHEMA}"
 PROXY_ADDR="${PROXY_HOST}:${PROXY_PORT}"
 
@@ -382,8 +382,9 @@ export no_proxy="${no_proxy:-localhost,127.0.0.1,::1}"
 export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,::1}"
 
 # Pre-flight Ingress L7 Readiness Wait & Dynamic Cluster Failover:
-# Bound total startup probing to <=3.5s so the IDE never kills the Language Server for timing out.
-# Give primary WORMHOLE_PORT a 1.2s priority window before failing over to PORT+1..PORT+5.
+# Bound total startup probing to <=4.5s so the IDE never kills the Language Server for timing out.
+# Give primary WORMHOLE_PORT a 1.5s priority window before failing over to PORT+1..PORT+5.
+# Also recognize clean TCP EOF (`ssh -R` alive while local proxy is restarting) so the wrapper stays active.
 WORMHOLE_HOST="${PROXY_ADDR%:*}"
 WORMHOLE_PORT="${PROXY_ADDR##*:}"
 _PORT_READY=0
@@ -397,24 +398,30 @@ host = sys.argv[1]
 base_port = int(sys.argv[2])
 proxy_type = sys.argv[3].lower()
 start = time.monotonic()
-deadline = start + 3.5
+deadline = start + 4.5
 
 def check_proto(port, mode, budget):
     if budget <= 0.05:
-        return False
+        return (False, False)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(budget)
+    connected = False
     try:
         sock.connect((host, port))
+        connected = True
         if mode == 'socks5':
             sock.sendall(b'\x05\x01\x00')
             data = sock.recv(2)
-            return len(data) >= 2 and data[0] == 5
+            if len(data) == 0:
+                return (False, True)
+            return (len(data) >= 2 and data[0] == 5, False)
         sock.sendall(b'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n')
         data = sock.recv(16)
-        return data.startswith(b'HTTP/')
-    except Exception:
-        return False
+        if len(data) == 0:
+            return (False, True)
+        return (data.upper().startswith(b'HTTP/'), False)
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return (False, False)
     finally:
         try:
             sock.close()
@@ -424,28 +431,39 @@ def check_proto(port, mode, budget):
 def probe_port(port):
     rem = deadline - time.monotonic()
     if rem <= 0.05:
-        return False
+        return (False, False)
     primary = 'socks5' if proxy_type == 'socks5' else 'http'
     alt = 'http' if primary == 'socks5' else 'socks5'
-    if check_proto(port, primary, min(0.35, rem)):
-        return True
+    ok1, eof1 = check_proto(port, primary, min(0.8, rem))
+    if ok1:
+        return (True, False)
     rem = deadline - time.monotonic()
-    if rem > 0.15 and check_proto(port, alt, min(0.35, rem)):
-        return True
-    return False
+    if rem > 0.15:
+        ok2, eof2 = check_proto(port, alt, min(0.8, rem))
+        if ok2:
+            return (True, False)
+        return (False, eof1 and eof2)
+    return (False, False)
 
+ssh_alive_port = None
 while time.monotonic() < deadline:
     elapsed = time.monotonic() - start
-    ports = [base_port] if elapsed < 1.2 else [base_port + o for o in (0, 1, 2, 3, 4, 5)]
+    ports = [base_port] if elapsed < 1.5 else [base_port + o for o in (0, 1, 2, 3, 4, 5)]
     for p in ports:
         if time.monotonic() >= deadline:
             break
-        if probe_port(p):
+        healthy, clean_eof = probe_port(p)
+        if healthy:
             print(f"{host}:{p}")
             sys.exit(0)
+        if clean_eof and (ssh_alive_port is None or p == base_port):
+            ssh_alive_port = p
     if time.monotonic() >= deadline:
         break
     time.sleep(0.15)
+if ssh_alive_port is not None:
+    print(f"{host}:{ssh_alive_port}")
+    sys.exit(0)
 sys.exit(1)
 PY_EOF
 )
@@ -462,28 +480,57 @@ PY_EOF
         _PORT_READY=1
     fi
 elif command -v timeout >/dev/null 2>&1; then
+    _probe_proto_bash() {
+        local _h="$1"
+        local _p="$2"
+        local _mode="$3"
+        if [ "$_mode" = "socks5" ]; then
+            timeout 0.9 bash -c 'exec 3<>/dev/tcp/"$0"/"$1" 2>/dev/null || exit 2; printf "\x05\x01\x00" >&3 || exit 2; IFS= read -r -t 0.8 -n 1 _c <&3; _rc=$?; [ "$_rc" -eq 0 ] && [ -n "$_c" ] && exit 0; [ "$_rc" -eq 1 ] && exit 3; exit 1' "$_h" "$_p" 2>/dev/null
+            return $?
+        else
+            timeout 0.9 bash -c 'exec 3<>/dev/tcp/"$0"/"$1" 2>/dev/null || exit 2; printf "HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3 || exit 2; IFS= read -r -t 0.8 _line <&3; _rc=$?; if [ "$_rc" -eq 0 ]; then case "$_line" in HTTP/*|http/*) exit 0 ;; *) exit 4 ;; esac; fi; [ "$_rc" -eq 1 ] && exit 3; exit 1' "$_h" "$_p" 2>/dev/null
+            return $?
+        fi
+    }
     _probe_proxy_l7() {
         local _h="$1"
         local _p="$2"
+        local _primary="http"
+        local _alt="socks5"
         if [ "$PROXY_TYPE" = "socks5" ]; then
-            timeout 0.4 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf '\x05\x01\x00' >&3 && IFS= read -r -t 0.3 -n 1 _c <&3" "$_h" "$_p" 2>/dev/null && return 0
-        else
-            timeout 0.4 bash -c "exec 3<>/dev/tcp/\${0}/\${1} && printf 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 && IFS= read -r -t 0.3 _line <&3 && [ -n \"\$_line\" ]" "$_h" "$_p" 2>/dev/null && return 0
+            _primary="socks5"
+            _alt="http"
+        fi
+        local _rc1=0
+        _probe_proto_bash "$_h" "$_p" "$_primary" || _rc1=$?
+        [ "$_rc1" -eq 0 ] && return 0
+        if [ "$_rc1" -eq 3 ] || [ "$_rc1" -eq 4 ]; then
+            local _rc2=0
+            _probe_proto_bash "$_h" "$_p" "$_alt" || _rc2=$?
+            [ "$_rc2" -eq 0 ] && return 0
+            [ "$_rc1" -eq 3 ] && [ "$_rc2" -eq 3 ] && return 3
         fi
         return 1
     }
-    _DEADLINE=$((SECONDS + 4))
+    _SSH_ALIVE_PORT=""
+    _DEADLINE=$((SECONDS + 5))
     for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         [ "$SECONDS" -ge "$_DEADLINE" ] && break
-        if _probe_proxy_l7 "${WORMHOLE_HOST}" "${WORMHOLE_PORT}"; then
+        _rc_p=0
+        _probe_proxy_l7 "${WORMHOLE_HOST}" "${WORMHOLE_PORT}" || _rc_p=$?
+        if [ "$_rc_p" -eq 0 ]; then
             _PORT_READY=1
             break
+        elif [ "$_rc_p" -eq 3 ]; then
+            _SSH_ALIVE_PORT="${WORMHOLE_PORT}"
         fi
         if [ "$_i" -ge 5 ]; then
             for _OFFSET in 1 2 3 4 5; do
                 [ "$SECONDS" -ge "$_DEADLINE" ] && break 2
                 _CAND_PORT=$((WORMHOLE_PORT + _OFFSET))
-                if _probe_proxy_l7 "${WORMHOLE_HOST}" "${_CAND_PORT}"; then
+                _rc_c=0
+                _probe_proxy_l7 "${WORMHOLE_HOST}" "${_CAND_PORT}" || _rc_c=$?
+                if [ "$_rc_c" -eq 0 ]; then
                     PROXY_ADDR="${WORMHOLE_HOST}:${_CAND_PORT}"
                     export http_proxy="http://${PROXY_ADDR}"
                     export https_proxy="http://${PROXY_ADDR}"
@@ -493,11 +540,25 @@ elif command -v timeout >/dev/null 2>&1; then
                     export ALL_PROXY="${PROXY_TYPE}://${PROXY_ADDR}"
                     _PORT_READY=1
                     break 2
+                elif [ "$_rc_c" -eq 3 ] && [ -z "$_SSH_ALIVE_PORT" ]; then
+                    _SSH_ALIVE_PORT="${_CAND_PORT}"
                 fi
             done
         fi
         sleep 0.25
     done
+    if [ "$_PORT_READY" = "0" ] && [ -n "$_SSH_ALIVE_PORT" ]; then
+        if [ "$_SSH_ALIVE_PORT" != "${WORMHOLE_PORT}" ]; then
+            PROXY_ADDR="${WORMHOLE_HOST}:${_SSH_ALIVE_PORT}"
+            export http_proxy="http://${PROXY_ADDR}"
+            export https_proxy="http://${PROXY_ADDR}"
+            export HTTP_PROXY="http://${PROXY_ADDR}"
+            export HTTPS_PROXY="http://${PROXY_ADDR}"
+            export all_proxy="${PROXY_TYPE}://${PROXY_ADDR}"
+            export ALL_PROXY="${PROXY_TYPE}://${PROXY_ADDR}"
+        fi
+        _PORT_READY=1
+    fi
 else
     _PORT_READY=1
 fi

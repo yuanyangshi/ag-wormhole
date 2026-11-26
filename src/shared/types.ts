@@ -2,6 +2,10 @@
  * AG-Wormhole - Type Definitions & Interfaces
  */
 
+export type TunnelFailureKind = 'none' | 'proxy-unstable' | 'tunnel-dead';
+
+export type SshTunnelPortProbeState = 'healthy' | 'ssh-alive-proxy-down' | 'dead';
+
 export interface ProxyStatus {
     runningLocation: 'local' | 'remote';
     sshConfigEnabled: boolean;
@@ -15,6 +19,8 @@ export interface ProxyStatus {
     activeTunnelPort?: number;
     isRelaying?: boolean;
     isTerminalProxyBypassed?: boolean;
+    watchdogState?: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED';
+    failureKind?: TunnelFailureKind;
 }
 
 export type StatusUpdateCallback = (status: ProxyStatus) => void;

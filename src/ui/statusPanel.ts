@@ -24,6 +24,7 @@ import {
     CMD_RESTORE_TERMINAL_PROXY
 } from '../shared/constants';
 import { logger } from '../shared/logger';
+import { escapeHtml } from '../shared/html';
 
 export class StatusPanel {
     private static currentPanel: StatusPanel | undefined;
@@ -217,6 +218,11 @@ export class StatusPanel {
         const isOnline = isLocal
             ? (this.currentStatus.sshConfigEnabled && this.currentStatus.localProxyReachable)
             : (this.currentStatus.remoteProxyReachable && this.currentStatus.languageServerConfigured);
+        const isDegraded = !isLocal && !isOnline && this.currentStatus.watchdogState === 'DEGRADED';
+        const statusBadgeClass = isOnline ? 'badge-online' : (isDegraded ? 'badge-warning' : 'badge-offline');
+        const statusBadgeLabel = isOnline ? 'Active' : (isDegraded ? 'Unstable' : 'Degraded');
+        const safeRemoteHost = escapeHtml(remoteHost);
+        const safeStatusRemoteHost = escapeHtml(this.currentStatus.remoteProxyHost);
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -285,6 +291,11 @@ export class StatusPanel {
             background: rgba(241, 76, 76, 0.15);
             color: var(--error);
             border: 1px solid var(--error);
+        }
+        .badge-warning {
+            background: rgba(206, 145, 120, 0.15);
+            color: var(--warning);
+            border: 1px solid var(--warning);
         }
         .grid {
             display: grid;
@@ -417,7 +428,7 @@ export class StatusPanel {
             </svg>
             <h1 class="title">AG-Wormhole</h1>
             <span class="badge badge-mode">${isLocal ? 'Local Mode' : 'Remote Mode'}</span>
-            <span class="badge ${isOnline ? 'badge-online' : 'badge-offline'}">${isOnline ? 'Active' : 'Degraded'}</span>
+            <span class="badge ${statusBadgeClass}">${statusBadgeLabel}</span>
         </div>
         <div class="btn-group" style="margin: 0;">
             <button class="btn btn-secondary" onclick="sendMessage('refresh')">Refresh</button>
@@ -450,7 +461,7 @@ export class StatusPanel {
             </div>
             ` : `
             <div class="metric-row">
-                <span class="metric-label">Remote Ingress (${this.currentStatus.remoteProxyHost}:${this.currentStatus.remoteProxyPort})</span>
+                <span class="metric-label">Remote Ingress (${safeStatusRemoteHost}:${this.currentStatus.remoteProxyPort})</span>
                 <span class="metric-value" style="color: ${this.currentStatus.remoteProxyReachable ? 'var(--success)' : 'var(--error)'};">
                     ${this.currentStatus.remoteProxyReachable ? 'Reachable' : 'Unreachable'}
                 </span>
@@ -528,7 +539,7 @@ export class StatusPanel {
             <div class="grid" style="margin-bottom: 0;">
                 <div class="form-group">
                     <label for="remoteProxyHost">Remote Ingress Host</label>
-                    <input type="text" class="form-control" id="remoteProxyHost" value="${remoteHost}">
+                    <input type="text" class="form-control" id="remoteProxyHost" value="${safeRemoteHost}">
                 </div>
                 <div class="form-group">
                     <label for="remoteProxyPort">Remote Ingress Port</label>
@@ -601,15 +612,28 @@ export class StatusPanel {
                 const copyBtn = document.getElementById('copyBtn');
                 if (copyBtn) copyBtn.style.display = 'inline-block';
 
+                function escapeHtml(s) {
+                    return String(s == null ? '' : s)
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/'/g, '&#39;');
+                }
+
                 let html = '<div style="display: flex; flex-direction: column; gap: 8px;">';
                 for (const check of report.checks) {
                     const color = check.status === 'success' ? 'var(--success)' :
                                   check.status === 'warning' ? 'var(--warning)' : 'var(--error)';
+                    const safeName = escapeHtml(check.name);
+                    const safeStatus = escapeHtml(String(check.status).toUpperCase());
+                    const safeMsg = check.message ? escapeHtml(check.message) : '';
+                    const safeSug = check.suggestion ? escapeHtml(check.suggestion) : '';
                     html += \`
                         <div class="diag-item">
-                            <div style="font-weight: 600; color: \${color};">\${check.name} (\${check.status.toUpperCase()})</div>
-                            \${check.message ? \`<div style="margin-top: 4px;">\${check.message}</div>\` : ''}
-                            \${check.suggestion ? \`<div style="margin-top: 4px; color: var(--text-secondary);">Suggestion: \${check.suggestion}</div>\` : ''}
+                            <div style="font-weight: 600; color: \${color};">\${safeName} (\${safeStatus})</div>
+                            \${safeMsg ? \`<div style="margin-top: 4px;">\${safeMsg}</div>\` : ''}
+                            \${safeSug ? \`<div style="margin-top: 4px; color: var(--text-secondary);">Suggestion: \${safeSug}</div>\` : ''}
                         </div>
                     \`;
                 }

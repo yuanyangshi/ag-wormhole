@@ -9,7 +9,7 @@ import * as net from 'net';
 import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { logger } from '../shared/logger';
-import { LanguageServerProcessInfo } from '../shared/types';
+import { LanguageServerProcessInfo, SshTunnelPortProbeState } from '../shared/types';
 import { getSystemArchitecture } from '../shared/environment';
 import { ALL_FALLBACK_PORT_OFFSETS } from '../shared/constants';
 
@@ -211,9 +211,24 @@ export class Provisioner {
         };
     }
 
+    private static async isProcessAliveNotZombie(pid: number): Promise<boolean> {
+        try {
+            const statContent = await fs.readFile(`/proc/${pid}/stat`, 'utf-8');
+            const closeParenIdx = statContent.lastIndexOf(')');
+            if (closeParenIdx === -1) {
+                return false;
+            }
+            const fields = statContent.slice(closeParenIdx + 2).trim().split(/\s+/);
+            const state = fields[0];
+            return Boolean(state && state !== 'Z' && state !== 'X');
+        } catch {
+            return false;
+        }
+    }
+
     /**
      * Inspect active Language Server / AGY runtime process state and proxy status.
-     * Uses zero-fork /proc/<pid> liveness verification on cached PIDs to avoid spawning
+     * Uses zero-fork /proc/<pid>/stat liveness verification on cached PIDs to avoid spawning
      * shell/ps subprocesses on periodic status refreshes.
      */
     public static async getLanguageServerProcess(forceRefresh: boolean = false): Promise<LanguageServerProcessInfo | null> {
@@ -224,12 +239,10 @@ export class Provisioner {
             Provisioner.cachedLsInfo.info.isUsingProxy &&
             now - Provisioner.cachedLsInfo.timestamp < 60000
         ) {
-            try {
-                await fs.access(`/proc/${Provisioner.cachedLsInfo.info.pid}`);
+            if (await Provisioner.isProcessAliveNotZombie(Provisioner.cachedLsInfo.info.pid)) {
                 return Provisioner.cachedLsInfo.info;
-            } catch {
-                Provisioner.cachedLsInfo = null;
             }
+            Provisioner.cachedLsInfo = null;
         }
 
         try {
@@ -289,28 +302,67 @@ export class Provisioner {
      * Terminate Language Server process to enforce wrapper adoption
      */
     public static async restartLanguageServer(): Promise<boolean> {
-        const proc = await Provisioner.getLanguageServerProcess();
+        const proc = await Provisioner.getLanguageServerProcess(true);
         if (!proc) {
             logger.log('No Language Server process found to restart', false);
             return false;
         }
 
+        Provisioner.cachedLsInfo = null;
         try {
             logger.log(`Terminating Language Server process (PID: ${proc.pid}, persistent: ${proc.isPersistent})`, false);
-            await execAsync(`kill ${proc.pid}`);
+            try {
+                process.kill(proc.pid, 'SIGTERM');
+            } catch {
+                // Already exited or inaccessible
+            }
             await new Promise(resolve => setTimeout(resolve, 1000));
 
-            const stillRunning = await Provisioner.getLanguageServerProcess();
+            const stillRunning = await Provisioner.getLanguageServerProcess(true);
             if (stillRunning && stillRunning.pid === proc.pid) {
                 logger.log('Process still active, issuing SIGKILL', false);
-                await execAsync(`kill -9 ${proc.pid}`);
+                try {
+                    process.kill(proc.pid, 'SIGKILL');
+                } catch {
+                    // Already exited
+                }
             }
+            Provisioner.cachedLsInfo = null;
             logger.log('Language Server terminated successfully', false);
             return true;
         } catch (error) {
             logger.log(`Failed to restart Language Server: ${error}`, false);
             return false;
         }
+    }
+
+    /**
+     * Atomically synchronize ~/.ag-wormhole/proxy.env for external shells (tmux/screen/nohup)
+     */
+    public static async syncProxyEnvHelper(host: string, port: number, proxyType: string): Promise<void> {
+        const envDir = path.join(os.homedir(), '.ag-wormhole');
+        const envFile = path.join(envDir, 'proxy.env');
+        const envTmp = `${envFile}.tmp.${process.pid}`;
+        const proxyAddr = `${host}:${port}`;
+        const content = [
+            '# AG-Wormhole Environment Variables',
+            '# Source this file in tmux, screen, nohup, or external terminal sessions:',
+            '#   source ~/.ag-wormhole/proxy.env',
+            `export http_proxy="http://${proxyAddr}"`,
+            `export https_proxy="http://${proxyAddr}"`,
+            `export HTTP_PROXY="http://${proxyAddr}"`,
+            `export HTTPS_PROXY="http://${proxyAddr}"`,
+            `export all_proxy="${proxyType}://${proxyAddr}"`,
+            `export ALL_PROXY="${proxyType}://${proxyAddr}"`,
+            'export no_proxy="localhost,127.0.0.1,::1"',
+            'export NO_PROXY="localhost,127.0.0.1,::1"',
+            ''
+        ].join('\n');
+
+        await fs.mkdir(envDir, { recursive: true });
+        await fs.writeFile(envTmp, content, 'utf-8');
+        await fs.rename(envTmp, envFile);
+        await fs.chmod(envFile, 0o644).catch(() => {});
     }
 
     /**
@@ -367,7 +419,7 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
         const scriptPath = path.join(extensionPath, 'scripts', 'setup-proxy.sh');
 
         try {
-            await execAsync(`chmod +x "${scriptPath}"`);
+            await fs.chmod(scriptPath, 0o755).catch(() => {});
 
             const packageJsonPath = path.join(extensionPath, 'package.json');
             let extensionVersion = '1.0.0';
@@ -388,8 +440,12 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
                 EXTENSION_VERSION: extensionVersion
             };
 
-            const { stdout, stderr } = await execAsync(`bash "${scriptPath}" 2>&1`, { env });
-            const output = stdout || stderr || '';
+            const { stdout, stderr } = await execFileAsync('bash', [scriptPath], {
+                env,
+                timeout: 15000,
+                maxBuffer: 1024 * 1024
+            });
+            const output = [stdout, stderr].filter(Boolean).join('\n');
             logger.log(`Setup execution output: ${output}`, false);
 
             const isNewConfig = output.includes('Setup complete') ||
@@ -655,7 +711,7 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
                 });
                 s.on('data', (chunk) => {
                     const text = chunk ? chunk.toString('utf8') : '';
-                    finish(/^HTTP\/1\.[01]\s+\d+/i.test(text));
+                    finish(/^HTTP\/\d/i.test(text));
                 });
                 s.on('timeout', () => finish(false));
                 s.on('error', () => finish(false));
@@ -717,6 +773,100 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
     }
 
     /**
+     * Classify a local SSH forwarded port into three states:
+     * - 'healthy': responds to HTTP or SOCKS5 proxy handshakes
+     * - 'ssh-alive-proxy-down': TCP connects and sshd returns clean EOF (`SSH2_MSG_CHANNEL_OPEN_FAILURE`)
+     *   because the local proxy is temporarily down/restarting while the SSH tunnel itself is live
+     * - 'dead': closed (`ECONNREFUSED`) or hung blackhole zombie (`timeout`)
+     */
+    public static async probeSshTunnelPort(port: number, timeoutMs: number = 600): Promise<SshTunnelPortProbeState> {
+        if (!port || port <= 0 || port > 65535) {
+            return 'dead';
+        }
+
+        const probeSingle = (
+            mode: 'http' | 'socks5',
+            budgetMs: number
+        ): Promise<'healthy' | 'eof' | 'reset-after-connect' | 'dead'> =>
+            new Promise((resolve) => {
+                const s = new net.Socket();
+                let settled = false;
+                let connected = false;
+                let sawErrorOrTimeout = false;
+
+                const finish = (state: 'healthy' | 'eof' | 'reset-after-connect' | 'dead') => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    s.removeAllListeners();
+                    s.destroy();
+                    resolve(state);
+                };
+
+                s.setTimeout(budgetMs);
+                s.on('connect', () => {
+                    connected = true;
+                    try {
+                        if (mode === 'socks5') {
+                            s.write(Buffer.from([0x05, 0x01, 0x00]));
+                        } else {
+                            s.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+                        }
+                    } catch {
+                        sawErrorOrTimeout = true;
+                        finish('dead');
+                    }
+                });
+                s.on('data', (chunk) => {
+                    if (!chunk || chunk.length === 0) {
+                        return;
+                    }
+                    if (mode === 'socks5') {
+                        finish(chunk.length >= 2 && chunk[0] === 0x05 ? 'healthy' : 'reset-after-connect');
+                    } else {
+                        const text = chunk.toString('utf8');
+                        finish(/^HTTP\/\d/i.test(text) ? 'healthy' : 'reset-after-connect');
+                    }
+                });
+                s.on('end', () => {
+                    finish(connected && !sawErrorOrTimeout ? 'eof' : 'dead');
+                });
+                s.on('timeout', () => {
+                    sawErrorOrTimeout = true;
+                    finish('dead');
+                });
+                s.on('error', () => {
+                    sawErrorOrTimeout = true;
+                    finish(connected ? 'reset-after-connect' : 'dead');
+                });
+                s.on('close', () => {
+                    if (!settled) {
+                        finish(connected && !sawErrorOrTimeout ? 'eof' : 'dead');
+                    }
+                });
+                s.connect(port, '127.0.0.1');
+            });
+
+        const httpRes = await probeSingle('http', timeoutMs);
+        if (httpRes === 'healthy') {
+            return 'healthy';
+        }
+        if (httpRes === 'dead') {
+            return 'dead';
+        }
+
+        const socksRes = await probeSingle('socks5', Math.min(timeoutMs, 500));
+        if (socksRes === 'healthy') {
+            return 'healthy';
+        }
+        if (httpRes === 'eof' && socksRes === 'eof') {
+            return 'ssh-alive-proxy-down';
+        }
+        return 'dead';
+    }
+
+    /**
      * Verify whether a keeper port (`basePort + 3`) represents an active SSH tunnel session:
      * returns `true` if it responds to L7 proxy handshakes OR if TCP connects and cleanly sends EOF (`FIN`),
      * which occurs when the local `ssh.exe` keeper is alive and immediately returns
@@ -724,59 +874,8 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
      * Hung/blackhole sockets (dead peer) and `ECONNREFUSED` return `false`.
      */
     public static async isKeeperSshSessionAlive(port: number, timeoutMs: number = 500): Promise<boolean> {
-        if (!port || port <= 0 || port > 65535) {
-            return false;
-        }
-        if (await Provisioner.isPortHealthyL7(port, timeoutMs)) {
-            return true;
-        }
-        return new Promise((resolve) => {
-            const s = new net.Socket();
-            let settled = false;
-            let connected = false;
-            let sawErrorOrTimeout = false;
-
-            const finish = (ok: boolean) => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                s.removeAllListeners();
-                s.destroy();
-                resolve(ok);
-            };
-
-            s.setTimeout(timeoutMs);
-            s.on('connect', () => {
-                connected = true;
-                try {
-                    s.write('HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
-                } catch {
-                    sawErrorOrTimeout = true;
-                    finish(false);
-                }
-            });
-            s.on('data', (chunk) => {
-                const text = chunk ? chunk.toString('utf8') : '';
-                const isProxy = /^HTTP\/1\.[01]\s+\d+/i.test(text) || Boolean(chunk && chunk.length >= 2 && chunk[0] === 0x05);
-                if (isProxy) {
-                    finish(true);
-                }
-            });
-            s.on('end', () => {
-                finish(connected && !sawErrorOrTimeout);
-            });
-            s.on('timeout', () => {
-                sawErrorOrTimeout = true;
-                finish(false);
-            });
-            s.on('error', () => {
-                sawErrorOrTimeout = true;
-                finish(false);
-            });
-            s.on('close', () => finish(false));
-            s.connect(port, '127.0.0.1');
-        });
+        const state = await Provisioner.probeSshTunnelPort(port, timeoutMs);
+        return state === 'healthy' || state === 'ssh-alive-proxy-down';
     }
 
     /**
@@ -940,11 +1039,21 @@ echo "[AG-Wormhole] Rollback complete: $RESTORED binary file(s) restored, runtim
 
         const pidsKilled: number[] = [];
         try {
-            // Fast-path L7 guard: never reclaim a port that is actively responding to L7 proxy handshakes
-            if (await Provisioner.isPortHealthyL7(port, 800)) {
+            // Fast-path SSH/L7 guard: never reclaim a port that is healthy at L7 OR backed by a live
+            // SSH tunnel returning clean EOF while the local proxy is temporarily restarting.
+            const tunnelState = await Provisioner.probeSshTunnelPort(port, 800);
+            if (tunnelState === 'healthy') {
                 return {
                     success: true,
                     message: `Port ${port} is healthy at L7 (reclamation skipped)`,
+                    pidsKilled: []
+                };
+            }
+            if (tunnelState === 'ssh-alive-proxy-down') {
+                logger.log(`Port ${port} has an active SSH tunnel (local proxy temporarily down); reclamation skipped`, false);
+                return {
+                    success: true,
+                    message: `Port ${port} has an active SSH tunnel (local proxy temporarily unreachable; reclamation skipped)`,
                     pidsKilled: []
                 };
             }

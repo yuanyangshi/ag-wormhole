@@ -54,6 +54,8 @@ let autoRefreshTimer: NodeJS.Timeout | undefined;
 let isManualProxyBypassed = false;
 let isAutoProxyBypassed = false;
 let lastAppliedProxySignature = '';
+let lastLsRecoveryRestartMs = 0;
+let prevWatchdogState: string | undefined;
 
 const isTerminalProxyEffectivelyBypassed = (): boolean => isManualProxyBypassed || isAutoProxyBypassed;
 
@@ -89,17 +91,21 @@ function applyRemoteProxyEnvironment(
     lastAppliedProxySignature = `${proxyType}://${host}:${port}`;
 }
 
-function clearRemoteProxyEnvironment(context: vscode.ExtensionContext): void {
+function clearTerminalProxyOnly(context: vscode.ExtensionContext): void {
     if (context.environmentVariableCollection) {
         context.environmentVariableCollection.clear();
     }
+    lastAppliedProxySignature = '';
+}
+
+function clearRemoteProxyEnvironment(context: vscode.ExtensionContext): void {
+    clearTerminalProxyOnly(context);
     delete process.env.http_proxy;
     delete process.env.https_proxy;
     delete process.env.HTTP_PROXY;
     delete process.env.HTTPS_PROXY;
     delete process.env.all_proxy;
     delete process.env.ALL_PROXY;
-    lastAppliedProxySignature = '';
 }
 
 let currentStatus: ProxyStatus = {
@@ -138,10 +144,11 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
     } else {
         const proxyType = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
         const watchdogMetrics = TunnelWatchdog.getInstance().getMetrics();
-        const isWatchdogFresh = (Date.now() - watchdogMetrics.lastChecked.getTime()) < 15000;
+        const isWatchdogFresh = (Date.now() - watchdogMetrics.lastChecked.getTime()) < 20000;
+        const effectiveCheckPort = watchdogMetrics.activeTunnelPort || remotePort;
         const remoteReachable = isWatchdogFresh
             ? (watchdogMetrics.state === 'HEALTHY')
-            : (await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 1500)).ok;
+            : (await TunnelManager.checkProxyL7(remoteHost, effectiveCheckPort, proxyType, 1500)).ok;
         const lsProcess = await Provisioner.getLanguageServerProcess();
         const isMgraftcpRunning = await Provisioner.isMgraftcpRunning();
         const isAgyConfigured = await Provisioner.isAgyRuntimeConfigured();
@@ -155,9 +162,11 @@ async function refreshAllStatus(): Promise<ProxyStatus> {
             localProxyReachable: false,
             remoteProxyReachable: remoteReachable || watchdogMetrics.state === 'HEALTHY',
             languageServerConfigured: Boolean(lsProcess?.isUsingProxy || isMgraftcpRunning || isAgyConfigured),
-            activeTunnelPort: watchdogMetrics.activeTunnelPort || remotePort,
+            activeTunnelPort: effectiveCheckPort,
             isRelaying: watchdogMetrics.isRelaying,
             isTerminalProxyBypassed: isTerminalProxyEffectivelyBypassed(),
+            watchdogState: watchdogMetrics.state,
+            failureKind: watchdogMetrics.failureKind,
             lastUpdated: new Date()
         };
     }
@@ -289,37 +298,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const host = config.get<string>(CFG_REMOTE_PROXY_HOST, DEFAULT_PROXY_HOST);
             const port = config.get<number>(CFG_REMOTE_PROXY_PORT, DEFAULT_PROXY_PORT);
             const type = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
+            const bypassFailureThreshold = metrics.failureKind === 'tunnel-dead' ? 5 : 10;
 
-            if (autoBypass && metrics.state === 'DISCONNECTED' && metrics.consecutiveFailures >= 3 && !isAutoProxyBypassed) {
-                logger.log('Tunnel Watchdog: Auto-bypassing terminal proxy due to tunnel disconnection.', false);
+            if (autoBypass && metrics.state === 'DISCONNECTED' && metrics.consecutiveFailures >= bypassFailureThreshold && !isAutoProxyBypassed) {
+                logger.log(`Tunnel Watchdog: Auto-bypassing terminal proxy due to ${metrics.failureKind || 'tunnel'} disconnection (failures: ${metrics.consecutiveFailures}).`, false);
                 isAutoProxyBypassed = true;
-                clearRemoteProxyEnvironment(context);
+                clearTerminalProxyOnly(context);
             } else if (metrics.state === 'HEALTHY') {
                 const effectivePort = (!metrics.isRelaying && metrics.activeTunnelPort)
                     ? metrics.activeTunnelPort
                     : port;
                 const targetSig = `${type}://${host}:${effectivePort}`;
-                if (isAutoProxyBypassed || (autoInject && lastAppliedProxySignature !== targetSig)) {
-                    if (isAutoProxyBypassed) {
+                const wasAutoBypassed = isAutoProxyBypassed;
+                if (wasAutoBypassed || (autoInject && lastAppliedProxySignature !== targetSig)) {
+                    if (wasAutoBypassed) {
                         logger.log('Tunnel Watchdog: Tunnel recovered; auto-restoring terminal proxy injection.', false);
                     }
                     isAutoProxyBypassed = false;
                     if (autoInject) {
                         applyRemoteProxyEnvironment(context, host, effectivePort, type);
+                        if (isLinuxPlatform()) {
+                            Provisioner.syncProxyEnvHelper(host, effectivePort, type).catch(() => {});
+                        }
+                    }
+                }
+                if ((prevWatchdogState === 'DISCONNECTED' || wasAutoBypassed) && isLinuxPlatform() && Date.now() - lastLsRecoveryRestartMs > 60000) {
+                    const proc = await Provisioner.getLanguageServerProcess(true);
+                    if (proc && proc.runtimeType === 'legacy' && !proc.isUsingProxy) {
+                        lastLsRecoveryRestartMs = Date.now();
+                        logger.log('Tunnel Watchdog: Legacy Language Server is running unproxied after recovery; restarting to re-enter mgraftcp sandbox.', false);
+                        await Provisioner.restartLanguageServer();
                     }
                 }
             }
+            prevWatchdogState = metrics.state;
         }
         await refreshAllStatus();
     });
 
-    if (isRunningLocally()) {
-        await activateLocal(context);
-    } else {
-        await activateRemote(context);
-    }
-
     // Lifecycle Hook: detect reinstallation or upgrade, and automatically purge stale caches
+    // Run BEFORE activateLocal/activateRemote so freshly spawned keepers/relays are never killed.
     const LAST_VERSION_KEY = 'ag-wormhole.lastInstalledVersion';
     const currentVersion = context.extension?.packageJSON?.version || '1.0.0';
     const lastVersion = context.globalState.get<string>(LAST_VERSION_KEY);
@@ -337,12 +355,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await context.globalState.update(LAST_VERSION_KEY, currentVersion);
     }
 
+    if (isRunningLocally()) {
+        await activateLocal(context);
+    } else {
+        await activateRemote(context);
+    }
+
     watchdog.start();
 
     // Auto-refresh interval
+    if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+    }
     autoRefreshTimer = setInterval(async () => {
         await refreshAllStatus();
     }, AUTO_REFRESH_INTERVAL_SEC * 1000);
+    if (typeof autoRefreshTimer.unref === 'function') {
+        autoRefreshTimer.unref();
+    }
+    context.subscriptions.push(new vscode.Disposable(() => {
+        if (autoRefreshTimer) {
+            clearInterval(autoRefreshTimer);
+            autoRefreshTimer = undefined;
+        }
+    }));
 
     // Instant probe on window focus (recovers instantly after laptop sleep or SSH reconnect)
     context.subscriptions.push(
@@ -413,70 +449,79 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
     const proxyType = config.get<string>(CFG_PROXY_TYPE, DEFAULT_PROXY_TYPE);
 
     // 1. Non-disruptive Readiness Probe:
-    // Allow an initial readiness window (~1200ms) for native SSH reverse port forwarding to bind,
+    // Allow an initial readiness window for native SSH reverse port forwarding to bind,
     // avoiding eager IngressRelay port collisions with incoming Remote-SSH sessions.
     let nativeHealthy = false;
     let liveFallbackPort: number | undefined;
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
         const primaryTcpOk = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 250);
         if (primaryTcpOk) {
-            const l7Check = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 400);
+            const l7Check = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 800);
             if (l7Check.ok) {
                 nativeHealthy = true;
                 logger.log(`Native SSH reverse tunnel is healthy on ${remoteHost}:${remotePort}`, false);
                 break;
             }
         }
-        if (attempt < 3) {
+        if (attempt < 2) {
             await new Promise((r) => setTimeout(r, 250));
         }
     }
 
     if (!nativeHealthy) {
-        // If native port is occupied by a dead zombie listener, reclaim it
-        const primaryTcpOk = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 150);
-        if (primaryTcpOk) {
-            const l7Check = await TunnelManager.checkProxyL7(remoteHost, remotePort, proxyType, 300);
-            if (!l7Check.ok) {
-                logger.log(`Pre-emptive Ingress Guard: Primary port ${remotePort} failed L7 check, reclaiming zombie listener...`, false);
+        const primaryState = await Provisioner.probeSshTunnelPort(remotePort, 800);
+        if (primaryState === 'healthy') {
+            nativeHealthy = true;
+            logger.log(`Native SSH reverse tunnel verified healthy on ${remoteHost}:${remotePort}`, false);
+        } else if (primaryState === 'ssh-alive-proxy-down') {
+            logger.log(`SSH reverse tunnel is active on ${remoteHost}:${remotePort} while local proxy stabilizes; skipping reclamation and preserving proxy environment.`, false);
+        } else {
+            // If native port is occupied by a dead zombie listener, reclaim it
+            const primaryTcpOk = await TunnelManager.checkPortAvailable(remoteHost, remotePort, 150);
+            if (primaryTcpOk) {
+                logger.log(`Pre-emptive Ingress Guard: Primary port ${remotePort} failed SSH/L7 probe, reclaiming zombie listener...`, false);
                 await Provisioner.reclaimPort(remotePort, remotePort);
             }
-        }
 
-        // Only start IngressRelay if a verified live fallback tunnel actually exists
-        // (e.g. from local Keeper or multi-port forward). Never blindly seize remotePort to point
-        // to dead fallback ports when no local tunnel exists at all.
-        const fallbackPorts = ALL_FALLBACK_PORT_OFFSETS.map(o => remotePort + o);
-        for (const fp of fallbackPorts) {
-            const fpAvail = await TunnelManager.checkPortAvailable(remoteHost, fp, 200);
-            if (fpAvail) {
-                const fpL7 = await TunnelManager.checkProxyL7(remoteHost, fp, proxyType, 350);
-                if (fpL7.ok) {
-                    liveFallbackPort = fp;
-                    break;
+            // Only start IngressRelay if a verified live fallback tunnel actually exists
+            // (e.g. from local Keeper or multi-port forward). Never blindly seize remotePort to point
+            // to dead fallback ports when no local tunnel exists at all.
+            const fallbackPorts = ALL_FALLBACK_PORT_OFFSETS.map(o => remotePort + o);
+            for (const fp of fallbackPorts) {
+                const fpAvail = await TunnelManager.checkPortAvailable(remoteHost, fp, 200);
+                if (fpAvail) {
+                    const fpL7 = await TunnelManager.checkProxyL7(remoteHost, fp, proxyType, 350);
+                    if (fpL7.ok) {
+                        liveFallbackPort = fp;
+                        break;
+                    }
                 }
             }
-        }
 
-        if (liveFallbackPort) {
-            logger.log(`Activating IngressRelay: bridging port ${remotePort} -> live fallback port ${liveFallbackPort}`, false);
-            await IngressRelay.getInstance().startRelay(remotePort, liveFallbackPort, fallbackPorts);
-        } else {
-            logger.log(`No active fallback tunnels detected; keeping port ${remotePort} unblocked for incoming SSH forwards.`, false);
-            const autoBypass = config.get<boolean>(CFG_AUTO_BYPASS_TERMINAL_ON_DISCONNECTED, true);
-            if (autoBypass) {
-                isAutoProxyBypassed = true;
-                logger.log('Cold start without active tunnel: deferred terminal proxy injection until tunnel is established.', false);
+            if (liveFallbackPort) {
+                logger.log(`Activating IngressRelay: bridging port ${remotePort} -> live fallback port ${liveFallbackPort}`, false);
+                const relayed = await IngressRelay.getInstance().startRelay(remotePort, liveFallbackPort, fallbackPorts);
+                if (!relayed) {
+                    logger.log(`IngressRelay could not bind primary port ${remotePort}; routing directly via verified fallback port ${liveFallbackPort}.`, false);
+                }
+            } else {
+                logger.log(`No active fallback tunnels detected; keeping port ${remotePort} unblocked for incoming SSH forwards.`, false);
+                const autoBypass = config.get<boolean>(CFG_AUTO_BYPASS_TERMINAL_ON_DISCONNECTED, true);
+                if (autoBypass) {
+                    isAutoProxyBypassed = true;
+                    logger.log('Cold start without active tunnel: deferred terminal proxy injection until tunnel is established.', false);
+                }
             }
         }
     }
 
+    const effectiveRemotePort = (!nativeHealthy && !IngressRelay.getInstance().isRelaying() && liveFallbackPort)
+        ? liveFallbackPort
+        : remotePort;
+
     // 2. Auto-inject terminal and extension-host proxy environment variables if enabled and not bypassed
     const autoInjectTerminal = config.get<boolean>(CFG_AUTO_INJECT_TERMINAL_PROXY, true);
     if (autoInjectTerminal && !isTerminalProxyEffectivelyBypassed()) {
-        const effectiveRemotePort = (!nativeHealthy && !IngressRelay.getInstance().isRelaying() && liveFallbackPort)
-            ? liveFallbackPort
-            : remotePort;
         applyRemoteProxyEnvironment(context, remoteHost, effectiveRemotePort, proxyType);
         logger.log(`Injected proxy environment variables into remote terminals: http://${remoteHost}:${effectiveRemotePort}`, false);
     }
@@ -530,7 +575,7 @@ async function activateRemote(context: vscode.ExtensionContext): Promise<void> {
     );
 
     // Auto-setup silently (trafficCollector starts on-demand only when Dashboard panel is opened)
-    await Provisioner.runSetupSilently(remoteHost, remotePort, proxyType, extensionPath);
+    await Provisioner.runSetupSilently(remoteHost, effectiveRemotePort, proxyType, extensionPath);
 
     // Check startup status (after watchdog probe has had a chance to bridge fallback ports if needed)
     const showStartupNotification = config.get<boolean>(CFG_SHOW_STATUS_ON_STARTUP, false);

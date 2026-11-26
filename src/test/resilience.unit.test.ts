@@ -6,6 +6,7 @@ import { TunnelManager } from '../core/tunnelManager';
 import { Provisioner } from '../core/provisioner';
 import { IngressRelay } from '../core/ingressRelay';
 import { TrafficCollector } from '../telemetry/trafficCollector';
+import { escapeHtml } from '../shared/html';
 
 suite('Resilience & Stability Unit Tests', function (this: Mocha.Suite) {
     this.timeout(10000);
@@ -822,12 +823,398 @@ suite('Resilience & Stability Unit Tests', function (this: Mocha.Suite) {
         }
     });
 
-    test('scripts/setup-proxy.sh retains pure LF line endings and WRAPPER_SCHEMA="2"', () => {
+    test('scripts/setup-proxy.sh retains pure LF line endings and WRAPPER_SCHEMA="4"', () => {
         const scriptPath = path.resolve(__dirname, '..', '..', 'scripts', 'setup-proxy.sh');
         const buf = fs.readFileSync(scriptPath);
         assert.strictEqual(buf.includes(0x0d), false, 'setup-proxy.sh must not contain CR bytes (CRLF)');
         const text = buf.toString('utf8');
-        assert.strictEqual(text.includes('WRAPPER_SCHEMA="2"'), true);
+        assert.strictEqual(text.includes('WRAPPER_SCHEMA="4"'), true);
+        assert.strictEqual(text.includes('ssh_alive_port'), true);
+        assert.strictEqual(text.includes('_SSH_ALIVE_PORT'), true);
+    });
+
+    test('Provisioner.probeSshTunnelPort classifies healthy, ssh-alive-proxy-down, and dead ports and reclaimPort skips clean-EOF', async () => {
+        const httpServer = net.createServer((sock) => {
+            sock.on('data', () => sock.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'));
+        });
+        const socksServer = net.createServer((sock) => {
+            sock.on('data', (d) => {
+                if (d.toString('utf8').startsWith('HEAD /')) {
+                    sock.destroy();
+                    return;
+                }
+                if (d.length >= 2 && d[0] === 0x05) {
+                    sock.write(Buffer.from([0x05, 0x00]));
+                }
+            });
+        });
+        const eofSockets: net.Socket[] = [];
+        const eofServer = net.createServer((sock) => {
+            eofSockets.push(sock);
+            sock.resume();
+            setTimeout(() => {
+                if (!sock.destroyed) {
+                    sock.end();
+                }
+            }, 15);
+        });
+        const blackholeSockets: net.Socket[] = [];
+        const blackholeServer = net.createServer((sock) => {
+            blackholeSockets.push(sock);
+        });
+
+        await Promise.all([
+            new Promise<void>((res) => httpServer.listen(0, '127.0.0.1', () => res())),
+            new Promise<void>((res) => socksServer.listen(0, '127.0.0.1', () => res())),
+            new Promise<void>((res) => eofServer.listen(0, '127.0.0.1', () => res())),
+            new Promise<void>((res) => blackholeServer.listen(0, '127.0.0.1', () => res()))
+        ]);
+
+        const tmpClosed = net.createServer();
+        await new Promise<void>((res) => tmpClosed.listen(0, '127.0.0.1', () => res()));
+        const closedPort = (tmpClosed.address() as net.AddressInfo).port;
+        await new Promise<void>((res) => tmpClosed.close(() => res()));
+
+        const httpPort = (httpServer.address() as net.AddressInfo).port;
+        const socksPort = (socksServer.address() as net.AddressInfo).port;
+        const eofPort = (eofServer.address() as net.AddressInfo).port;
+        const blackholePort = (blackholeServer.address() as net.AddressInfo).port;
+
+        try {
+            assert.strictEqual(await Provisioner.probeSshTunnelPort(httpPort, 500), 'healthy');
+            assert.strictEqual(await Provisioner.probeSshTunnelPort(socksPort, 500), 'healthy');
+            assert.strictEqual(await Provisioner.probeSshTunnelPort(eofPort, 500), 'ssh-alive-proxy-down');
+            assert.strictEqual(await Provisioner.probeSshTunnelPort(blackholePort, 200), 'dead');
+            assert.strictEqual(await Provisioner.probeSshTunnelPort(closedPort, 200), 'dead');
+
+            const reclaimRes = await Provisioner.reclaimPort(eofPort, eofPort);
+            assert.strictEqual(reclaimRes.success, true);
+            assert.strictEqual(reclaimRes.pidsKilled.length, 0);
+            assert.ok(reclaimRes.message.includes('active SSH tunnel'));
+        } finally {
+            for (const s of [...eofSockets, ...blackholeSockets]) {
+                s.destroy();
+            }
+            await Promise.all([
+                new Promise<void>((res) => httpServer.close(() => res())),
+                new Promise<void>((res) => socksServer.close(() => res())),
+                new Promise<void>((res) => eofServer.close(() => res())),
+                new Promise<void>((res) => blackholeServer.close(() => res()))
+            ]);
+        }
+    });
+
+    test('TunnelManager.checkProxyL7 returns structured reason codes for ok, eof, econnrefused, and timeout', async () => {
+        const httpServer = net.createServer((sock) => {
+            sock.on('data', () => sock.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'));
+        });
+        const eofSockets: net.Socket[] = [];
+        const eofServer = net.createServer((sock) => {
+            eofSockets.push(sock);
+            sock.resume();
+            setTimeout(() => {
+                if (!sock.destroyed) {
+                    sock.end();
+                }
+            }, 15);
+        });
+        const blackholeSockets: net.Socket[] = [];
+        const blackholeServer = net.createServer((sock) => {
+            blackholeSockets.push(sock);
+        });
+
+        await Promise.all([
+            new Promise<void>((res) => httpServer.listen(0, '127.0.0.1', () => res())),
+            new Promise<void>((res) => eofServer.listen(0, '127.0.0.1', () => res())),
+            new Promise<void>((res) => blackholeServer.listen(0, '127.0.0.1', () => res()))
+        ]);
+
+        const tmpClosed = net.createServer();
+        await new Promise<void>((res) => tmpClosed.listen(0, '127.0.0.1', () => res()));
+        const closedPort = (tmpClosed.address() as net.AddressInfo).port;
+        await new Promise<void>((res) => tmpClosed.close(() => res()));
+
+        try {
+            const okRes = await TunnelManager.checkProxyL7('127.0.0.1', (httpServer.address() as net.AddressInfo).port, 'http', 800);
+            assert.strictEqual(okRes.ok, true);
+            assert.strictEqual(okRes.reason, 'ok');
+
+            const eofRes = await TunnelManager.checkProxyL7('127.0.0.1', (eofServer.address() as net.AddressInfo).port, 'http', 500);
+            assert.strictEqual(eofRes.ok, false);
+            assert.strictEqual(eofRes.reason, 'eof');
+
+            const refusedRes = await TunnelManager.checkProxyL7('127.0.0.1', closedPort, 'http', 500);
+            assert.strictEqual(refusedRes.ok, false);
+            assert.strictEqual(refusedRes.reason, 'econnrefused');
+
+            const timeoutRes = await TunnelManager.checkProxyL7('127.0.0.1', (blackholeServer.address() as net.AddressInfo).port, 'http', 200);
+            assert.strictEqual(timeoutRes.ok, false);
+            assert.strictEqual(timeoutRes.reason, 'timeout');
+        } finally {
+            for (const s of [...eofSockets, ...blackholeSockets]) {
+                s.destroy();
+            }
+            await Promise.all([
+                new Promise<void>((res) => httpServer.close(() => res())),
+                new Promise<void>((res) => eofServer.close(() => res())),
+                new Promise<void>((res) => blackholeServer.close(() => res()))
+            ]);
+        }
+    });
+
+    test('IngressRelay tolerates 1350ms CONNECT with 500ms L7 probe jitter and absorbs 1.5s proxy restart', async () => {
+        const relay = IngressRelay.getInstance();
+        const getFreePort = async (): Promise<number> => {
+            const s = net.createServer();
+            await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+            const p = (s.address() as net.AddressInfo).port;
+            await new Promise<void>((res) => s.close(() => res()));
+            return p;
+        };
+
+        // Part A: 1350ms CONNECT dial + 500ms L7 probe jitter
+        const listenPortA = await getFreePort();
+        const jitterSockets: net.Socket[] = [];
+        const jitterProxy = net.createServer((sock) => {
+            jitterSockets.push(sock);
+            sock.on('data', (d) => {
+                const req = d.toString('utf8');
+                if (req.startsWith('HEAD /')) {
+                    setTimeout(() => {
+                        if (!sock.destroyed) {
+                            sock.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+                        }
+                    }, 500);
+                } else if (req.startsWith('CONNECT ')) {
+                    setTimeout(() => {
+                        if (!sock.destroyed) {
+                            sock.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+                        }
+                    }, 1350);
+                }
+            });
+        });
+        await new Promise<void>((res) => jitterProxy.listen(0, '127.0.0.1', () => res()));
+        const jitterPort = (jitterProxy.address() as net.AddressInfo).port;
+
+        try {
+            assert.strictEqual(await relay.startRelay(listenPortA, jitterPort, [jitterPort]), true);
+            const client = new net.Socket();
+            const resp = await new Promise<string>((resolve, reject) => {
+                client.connect(listenPortA, '127.0.0.1', () => {
+                    client.write('CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n');
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk.toString('utf8'));
+                });
+                client.on('error', reject);
+            });
+            assert.ok(resp.includes('200 Connection Established'));
+        } finally {
+            await relay.stopRelay();
+            for (const s of jitterSockets) {
+                s.destroy();
+            }
+            await new Promise<void>((res) => jitterProxy.close(() => res()));
+        }
+
+        // Part B: 1.5s local proxy restart (clean EOF during restart window -> recovery)
+        const listenPortB = await getFreePort();
+        let proxyRestarted = false;
+        const restartTimer = setTimeout(() => {
+            proxyRestarted = true;
+        }, 1500);
+        const restartSockets: net.Socket[] = [];
+        const restartServer = net.createServer((sock) => {
+            restartSockets.push(sock);
+            sock.on('data', (d) => {
+                if (!proxyRestarted) {
+                    sock.end();
+                } else {
+                    sock.write(`RESTART_RECOVERY_OK_${d.toString('utf8')}`);
+                }
+            });
+        });
+        await new Promise<void>((res) => restartServer.listen(0, '127.0.0.1', () => res()));
+        const restartPort = (restartServer.address() as net.AddressInfo).port;
+
+        try {
+            assert.strictEqual(await relay.startRelay(listenPortB, restartPort, [restartPort]), true);
+            const client = new net.Socket();
+            const resp = await new Promise<string>((resolve, reject) => {
+                client.connect(listenPortB, '127.0.0.1', () => {
+                    client.write('HELLO_AFTER_RESTART');
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk.toString('utf8'));
+                });
+                client.on('error', reject);
+            });
+            assert.strictEqual(resp, 'RESTART_RECOVERY_OK_HELLO_AFTER_RESTART');
+        } finally {
+            clearTimeout(restartTimer);
+            await relay.stopRelay();
+            for (const s of restartSockets) {
+                s.destroy();
+            }
+            await new Promise<void>((res) => restartServer.close(() => res()));
+        }
+    });
+
+    test('IngressRelay verifies L7 on idle zero-byte pre-warmed connections and bypasses blackhole ports', async () => {
+        const relay = IngressRelay.getInstance();
+        const getFreePort = async (): Promise<number> => {
+            const s = net.createServer();
+            await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+            const p = (s.address() as net.AddressInfo).port;
+            await new Promise<void>((res) => s.close(() => res()));
+            return p;
+        };
+
+        const listenPort = await getFreePort();
+        const blackholeSockets: net.Socket[] = [];
+        const blackholeServer = net.createServer((sock) => {
+            blackholeSockets.push(sock);
+        });
+        const liveSockets: net.Socket[] = [];
+        const liveServer = net.createServer((sock) => {
+            liveSockets.push(sock);
+            sock.on('data', (d) => {
+                const text = d.toString('utf8');
+                if (text.startsWith('HEAD /')) {
+                    sock.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+                } else {
+                    sock.write(`PREWARM_OK_${text}`);
+                }
+            });
+        });
+
+        await Promise.all([
+            new Promise<void>((res) => blackholeServer.listen(0, '127.0.0.1', () => res())),
+            new Promise<void>((res) => liveServer.listen(0, '127.0.0.1', () => res()))
+        ]);
+        const blackholePort = (blackholeServer.address() as net.AddressInfo).port;
+        const livePort = (liveServer.address() as net.AddressInfo).port;
+
+        try {
+            assert.strictEqual(await relay.startRelay(listenPort, blackholePort, [blackholePort, livePort]), true);
+            const client = new net.Socket();
+            const resp = await new Promise<string>((resolve, reject) => {
+                client.connect(listenPort, '127.0.0.1', () => {
+                    // Hold connection idle (0 bytes sent) past firstResponseTimeoutMs + L7 probe
+                    const waitTimer = setInterval(() => {
+                        if (relay.getRelayInfo().targetPort === livePort) {
+                            clearInterval(waitTimer);
+                            client.write('PING');
+                        }
+                    }, 50);
+                    setTimeout(() => clearInterval(waitTimer), 5000);
+                });
+                client.on('data', (chunk) => {
+                    client.destroy();
+                    resolve(chunk.toString('utf8'));
+                });
+                client.on('error', reject);
+            });
+            assert.strictEqual(resp, 'PREWARM_OK_PING');
+            assert.strictEqual(relay.getRelayInfo().targetPort, livePort);
+        } finally {
+            await relay.stopRelay();
+            for (const s of [...blackholeSockets, ...liveSockets]) {
+                s.destroy();
+            }
+            await Promise.all([
+                new Promise<void>((res) => blackholeServer.close(() => res())),
+                new Promise<void>((res) => liveServer.close(() => res()))
+            ]);
+        }
+    });
+
+    test('IngressRelay aborts cleanly instead of replaying truncated payload when upload exceeds maxPreBufferBytes', async () => {
+        const relay = IngressRelay.getInstance();
+        const getFreePort = async (): Promise<number> => {
+            const s = net.createServer();
+            await new Promise<void>((res) => s.listen(0, '127.0.0.1', () => res()));
+            const p = (s.address() as net.AddressInfo).port;
+            await new Promise<void>((res) => s.close(() => res()));
+            return p;
+        };
+
+        const listenPort = await getFreePort();
+        const failSockets: net.Socket[] = [];
+        const delayedFailServer = net.createServer((sock) => {
+            failSockets.push(sock);
+            sock.on('data', () => {
+                setTimeout(() => {
+                    if (!sock.destroyed) {
+                        sock.destroy();
+                    }
+                }, 80);
+            });
+        });
+
+        let liveConnectionsCount = 0;
+        const liveServer = net.createServer((sock) => {
+            liveConnectionsCount++;
+            sock.destroy();
+        });
+
+        await Promise.all([
+            new Promise<void>((res) => delayedFailServer.listen(0, '127.0.0.1', () => res())),
+            new Promise<void>((res) => liveServer.listen(0, '127.0.0.1', () => res()))
+        ]);
+        const failPort = (delayedFailServer.address() as net.AddressInfo).port;
+        const livePort = (liveServer.address() as net.AddressInfo).port;
+
+        try {
+            assert.strictEqual(await relay.startRelay(listenPort, failPort, [failPort, livePort]), true);
+            const client = new net.Socket();
+            await new Promise<void>((resolve) => {
+                client.connect(listenPort, '127.0.0.1', () => {
+                    client.write(Buffer.alloc(300 * 1024, 0x41));
+                });
+                client.on('close', () => resolve());
+                client.on('error', () => resolve());
+            });
+            assert.strictEqual(liveConnectionsCount, 0);
+        } finally {
+            await relay.stopRelay();
+            for (const s of failSockets) {
+                s.destroy();
+            }
+            await Promise.all([
+                new Promise<void>((res) => delayedFailServer.close(() => res())),
+                new Promise<void>((res) => liveServer.close(() => res()))
+            ]);
+        }
+    });
+
+    test('TunnelManager.hasKeeperForwardSpecChanged detects local or remote port drift accurately', () => {
+        assert.deepStrictEqual(
+            TunnelManager.hasKeeperForwardSpecChanged('', 7890, 7890),
+            { changed: false, nextSpec: '7890->7890' }
+        );
+        assert.deepStrictEqual(
+            TunnelManager.hasKeeperForwardSpecChanged('7890->7890', 7890, 7890),
+            { changed: false, nextSpec: '7890->7890' }
+        );
+        assert.deepStrictEqual(
+            TunnelManager.hasKeeperForwardSpecChanged('7890->7890', 7897, 7890),
+            { changed: true, nextSpec: '7897->7890' }
+        );
+        assert.deepStrictEqual(
+            TunnelManager.hasKeeperForwardSpecChanged('7890->7890', 7890, 17890),
+            { changed: true, nextSpec: '7890->17890' }
+        );
+    });
+
+    test('escapeHtml safely neutralizes HTML and attribute injection vectors', () => {
+        assert.strictEqual(
+            escapeHtml('<script>alert("x") & \'y\'</script>'),
+            '&lt;script&gt;alert(&quot;x&quot;) &amp; &#39;y&#39;&lt;/script&gt;'
+        );
     });
 });
 

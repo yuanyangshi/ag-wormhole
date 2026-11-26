@@ -78,6 +78,14 @@ export class StatusBarController implements vscode.Disposable {
                 this.statusBarItem.color = '#e2c08d';
                 this.statusBarItem.backgroundColor = undefined;
                 tooltip += `Status: Setup Pending\n`;
+            } else if (status.watchdogState === 'DEGRADED' && !status.isTerminalProxyBypassed) {
+                icon = '🟡';
+                label = 'AGW (Unstable)';
+                this.statusBarItem.color = '#e2c08d';
+                this.statusBarItem.backgroundColor = undefined;
+                tooltip += status.failureKind === 'proxy-unstable'
+                    ? `Status: Local Proxy Unstable / Reconnecting (SSH Tunnel Active)\n`
+                    : `Status: Tunnel Degraded (Probing...)\n`;
             } else {
                 icon = '🔴';
                 this.statusBarItem.color = '#f14c4c';

@@ -18,10 +18,11 @@ export class IngressRelay {
     private candidatePorts: number[] = [];
     private transitionChain: Promise<void> = Promise.resolve();
 
-    private readonly maxRounds = 25;
+    private readonly maxRounds = 40;
+    private readonly maxHoldMs = 15000;
     private readonly baseRetryDelayMs = 150;
-    private readonly maxPreBufferBytes = 65536;
-    private readonly firstResponseTimeoutMs = 800;
+    private readonly maxPreBufferBytes = 262144;
+    private readonly firstResponseTimeoutMs = 1200;
 
     private constructor() {}
 
@@ -57,9 +58,9 @@ export class IngressRelay {
     /**
      * Perform a fast application-level (L7) proxy verification against a candidate port
      * to reject dead zombie sshd sockets that accept TCP SYN-ACKs but hang or immediately EOF.
-     * Supports both HTTP proxy and SOCKS5 upstreams.
+     * Probes HTTP and SOCKS5 upstreams in parallel with full timeout budget.
      */
-    private async verifyUpstreamCandidateL7(port: number, timeoutMs: number = 600): Promise<boolean> {
+    private async verifyUpstreamCandidateL7(port: number, timeoutMs: number = 1000): Promise<boolean> {
         const probeSingle = (mode: 'http' | 'socks5', budgetMs: number): Promise<boolean> =>
             new Promise((resolve) => {
                 const probeSocket = new net.Socket();
@@ -99,7 +100,7 @@ export class IngressRelay {
                         finish(chunk.length >= 2 && chunk[0] === 0x05);
                     } else {
                         const text = chunk.toString('utf8');
-                        finish(/^HTTP\/1\.[01]\s+\d+/i.test(text));
+                        finish(/^HTTP\/\d/i.test(text));
                     }
                 });
 
@@ -110,11 +111,28 @@ export class IngressRelay {
                 probeSocket.connect(port, '127.0.0.1');
             });
 
-        const budget = Math.max(250, Math.floor(timeoutMs * 0.6));
-        if (await probeSingle('http', budget)) {
-            return true;
-        }
-        return probeSingle('socks5', budget);
+        const budget = Math.max(300, timeoutMs);
+        return new Promise((resolve) => {
+            let pending = 2;
+            let settled = false;
+            const onResult = (ok: boolean) => {
+                if (settled) {
+                    return;
+                }
+                if (ok) {
+                    settled = true;
+                    resolve(true);
+                    return;
+                }
+                pending--;
+                if (pending === 0) {
+                    settled = true;
+                    resolve(false);
+                }
+            };
+            probeSingle('http', budget).then(onResult).catch(() => onResult(false));
+            probeSingle('socks5', budget).then(onResult).catch(() => onResult(false));
+        });
     }
 
     /**
@@ -255,11 +273,13 @@ export class IngressRelay {
                 clientSocket.setNoDelay(true);
                 clientSocket.setKeepAlive(true, 15000);
 
+                const connectStartMs = Date.now();
                 let round = 0;
                 let activeTargetSocket: net.Socket | null = null;
                 let isPiped = false;
                 let isConnectedToCandidate = false;
                 let totalBufferedBytes = 0;
+                let preBufferOverflowed = false;
                 const clientPreBuffer: Buffer[] = [];
                 let firstResponseTimer: NodeJS.Timeout | null = null;
 
@@ -275,9 +295,11 @@ export class IngressRelay {
                     if (isPiped) {
                         return;
                     }
-                    if (totalBufferedBytes + chunk.length <= this.maxPreBufferBytes) {
+                    if (!preBufferOverflowed && totalBufferedBytes + chunk.length <= this.maxPreBufferBytes) {
                         clientPreBuffer.push(Buffer.from(chunk));
                         totalBufferedBytes += chunk.length;
+                    } else {
+                        preBufferOverflowed = true;
                     }
                     if (isConnectedToCandidate && activeTargetSocket && !activeTargetSocket.destroyed) {
                         try {
@@ -299,8 +321,9 @@ export class IngressRelay {
                     const orderedPorts = this.getOrderedCandidatePorts(targetPort, listenPort);
                     if (candidateIdx >= orderedPorts.length) {
                         round++;
-                        if (round < this.maxRounds && !clientSocket.destroyed) {
-                            const delay = Math.min(350, this.baseRetryDelayMs + round * 15);
+                        const elapsedMs = Date.now() - connectStartMs;
+                        if (round < this.maxRounds && elapsedMs < this.maxHoldMs && !clientSocket.destroyed) {
+                            const delay = Math.min(500, this.baseRetryDelayMs + round * 20);
                             setTimeout(() => tryHuntAndConnect(0), delay);
                         } else if (!clientSocket.destroyed) {
                             clientSocket.destroy();
@@ -373,6 +396,13 @@ export class IngressRelay {
                             }
                             return;
                         }
+                        if (preBufferOverflowed) {
+                            // Cannot safely replay a complete request when initial bytes exceeded maxPreBufferBytes
+                            if (!clientSocket.destroyed) {
+                                clientSocket.destroy();
+                            }
+                            return;
+                        }
                         if (!clientSocket.destroyed) {
                             // Immediately try the next candidate port in the cluster and replay clientPreBuffer
                             tryHuntAndConnect(candidateIdx + 1);
@@ -381,8 +411,8 @@ export class IngressRelay {
 
                     targetSocket.connect(candidatePort, '127.0.0.1', () => {
                         // Extend socket timeout past firstResponseTimeoutMs + out-of-band L7 probe
-                        // so slow outbound HTTP CONNECT / SOCKS5 dials are never killed prematurely at 700ms.
-                        targetSocket.setTimeout(this.firstResponseTimeoutMs + 1500);
+                        // so slow outbound HTTP CONNECT / SOCKS5 dials are never killed prematurely during jitter.
+                        targetSocket.setTimeout(this.firstResponseTimeoutMs + 2500);
                         // Guard against zombie sshd ports that complete TCP 3-way handshake
                         // and then either immediately send FIN/RST or swallow the request as a half-open blackhole.
                         graceTimer = setTimeout(() => {
@@ -400,18 +430,14 @@ export class IngressRelay {
                             }
                             // Wait for the first upstream response byte; if candidate does not respond within
                             // firstResponseTimeoutMs, verify L7 proxy liveness out-of-band so slow outbound
-                            // HTTP CONNECT dials (>400ms) are committed safely while half-open blackhole sshd
+                            // HTTP CONNECT dials are committed safely while half-open blackhole sshd
                             // sockets fail over and replay clientPreBuffer to the next port.
                             clearResponseTimer();
                             firstResponseTimer = setTimeout(() => {
                                 if (isPiped || clientSocket.destroyed || targetSocket.destroyed) {
                                     return;
                                 }
-                                if (totalBufferedBytes === 0) {
-                                    commitVerifiedPipe();
-                                    return;
-                                }
-                                this.verifyUpstreamCandidateL7(candidatePort, 600).then((l7Alive) => {
+                                this.verifyUpstreamCandidateL7(candidatePort, 1000).then((l7Alive) => {
                                     if (isPiped || clientSocket.destroyed || targetSocket.destroyed) {
                                         return;
                                     }

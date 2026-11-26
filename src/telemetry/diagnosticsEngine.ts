@@ -7,7 +7,7 @@ import * as net from 'net';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { DiagnosticCheck, DiagnosticReport, ProtocolTestResult } from '../shared/types';
 import { isRunningLocally } from '../shared/environment';
@@ -26,8 +26,11 @@ import {
 } from '../shared/constants';
 import { SSHConfigManager } from '../core/sshConfigManager';
 import { TunnelManager } from '../core/tunnelManager';
+import { Provisioner } from '../core/provisioner';
+import { TunnelWatchdog } from '../core/watchdog';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export type DiagnosticsProgressCallback = (checks: DiagnosticCheck[]) => void;
 
@@ -135,7 +138,7 @@ export class DiagnosticsEngine {
         return check;
     }
 
-    public static async checkRemotePortForward(host: string, port: number): Promise<DiagnosticCheck> {
+    public static async checkRemotePortForward(host: string, port: number, proxyType: string = DEFAULT_PROXY_TYPE): Promise<DiagnosticCheck> {
         const check: DiagnosticCheck = {
             id: 'remote-forward',
             name: 'Remote Ingress Port Forwarding',
@@ -145,21 +148,52 @@ export class DiagnosticsEngine {
         try {
             const reachable = await DiagnosticsEngine.checkPort(host, port);
             if (reachable) {
-                const l7 = await TunnelManager.checkProxyL7(host, port, DEFAULT_PROXY_TYPE, 2000);
+                const l7 = await TunnelManager.checkProxyL7(host, port, proxyType, 2000);
                 if (l7.ok) {
                     check.status = 'success';
                     check.message = `Ingress endpoint ${host}:${port} is reachable (${l7.message})`;
-                } else {
-                    check.status = 'error';
-                    check.message = `Ingress port ${host}:${port} is open at TCP layer, but L7 proxy probe failed (${l7.message})`;
-                    check.suggestion = 'Ensure your local proxy (Clash/v2ray) is running and the SSH reverse tunnel is connected.';
+                    return check;
                 }
+
+                const sshState = await Provisioner.probeSshTunnelPort(port, 600);
+                if (sshState === 'ssh-alive-proxy-down') {
+                    check.status = 'warning';
+                    check.message = `SSH reverse tunnel on ${host}:${port} is connected, but the local proxy is temporarily unreachable or restarting`;
+                    check.suggestion = 'Verify your local proxy (Clash/v2ray) is running and accepting connections.';
+                    return check;
+                }
+
+                const activeTunnelPort = TunnelWatchdog.getInstance().getMetrics().activeTunnelPort;
+                if (activeTunnelPort && activeTunnelPort !== port) {
+                    const fallbackL7 = await TunnelManager.checkProxyL7(host, activeTunnelPort, proxyType, 1500);
+                    if (fallbackL7.ok) {
+                        check.status = 'success';
+                        check.message = `Primary port ${port} is busy, traffic active on fallback tunnel ${host}:${activeTunnelPort} (${fallbackL7.message})`;
+                        return check;
+                    }
+                }
+
+                check.status = 'error';
+                check.message = `Ingress port ${host}:${port} is open at TCP layer, but L7 proxy probe failed (${l7.message})`;
+                check.suggestion = 'Ensure your local proxy (Clash/v2ray) is running and the SSH reverse tunnel is connected.';
             } else {
+                const activeTunnelPort = TunnelWatchdog.getInstance().getMetrics().activeTunnelPort;
+                if (activeTunnelPort && activeTunnelPort !== port) {
+                    const fallbackL7 = await TunnelManager.checkProxyL7(host, activeTunnelPort, proxyType, 1500);
+                    if (fallbackL7.ok) {
+                        check.status = 'success';
+                        check.message = `Fallback tunnel endpoint ${host}:${activeTunnelPort} is reachable (${fallbackL7.message})`;
+                        return check;
+                    }
+                }
+
                 let zombieInfo = '';
                 try {
                     const { stdout } = await execAsync(`lsof -nP -t -iTCP:${port} -sTCP:LISTEN 2>/dev/null || true`);
                     if (stdout.trim().length > 0) {
                         zombieInfo = ` (Port is occupied by process PID: ${stdout.trim()})`;
+                    } else if (await Provisioner.isPortListeningUnprivileged(port)) {
+                        zombieInfo = ' (Port is bound by an unprivileged listener)';
                     }
                 } catch {
                     // Ignore inspection error
@@ -378,9 +412,24 @@ export class DiagnosticsEngine {
 
         for (const protocol of protocols) {
             const isCurrent = protocol === currentType;
+            const curlProto = protocol === 'socks5' ? 'socks5h' : 'http';
             try {
-                const cmd = `curl -x ${protocol}://${host}:${port} https://www.google.com -s -o /dev/null -w "%{http_code}" --connect-timeout 10`;
-                const { stdout } = await execAsync(cmd, { timeout: 15000 });
+                const { stdout } = await execFileAsync(
+                    'curl',
+                    [
+                        '-x',
+                        `${curlProto}://${host}:${port}`,
+                        'https://www.google.com',
+                        '-s',
+                        '-o',
+                        '/dev/null',
+                        '-w',
+                        '%{http_code}',
+                        '--connect-timeout',
+                        '10'
+                    ],
+                    { timeout: 15000 }
+                );
                 const httpCode = stdout.trim();
                 const ok = httpCode === '200' || httpCode === '301' || httpCode === '302';
 
@@ -467,7 +516,7 @@ export class DiagnosticsEngine {
         } else {
             checks[0].status = 'running';
             onProgress?.([...checks]);
-            const r0 = await DiagnosticsEngine.checkRemotePortForward(remoteHost, remotePort);
+            const r0 = await DiagnosticsEngine.checkRemotePortForward(remoteHost, remotePort, proxyType);
             updateCheck(0, r0);
 
             checks[1].status = 'running';
@@ -486,9 +535,13 @@ export class DiagnosticsEngine {
             updateCheck(3, r3);
 
             if (r0.status === 'success') {
+                const wdMetrics = TunnelWatchdog.getInstance().getMetrics();
+                const effectivePort = (!wdMetrics.isRelaying && wdMetrics.activeTunnelPort)
+                    ? wdMetrics.activeTunnelPort
+                    : remotePort;
                 checks[4].status = 'running';
                 onProgress?.([...checks]);
-                const r4 = await DiagnosticsEngine.checkExternalConnectivity(remoteHost, remotePort, proxyType);
+                const r4 = await DiagnosticsEngine.checkExternalConnectivity(remoteHost, effectivePort, proxyType);
                 updateCheck(4, r4);
             } else {
                 updateCheck(4, {
